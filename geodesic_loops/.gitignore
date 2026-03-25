@@ -1,0 +1,6 @@
+target/
+*.whl
+__pycache__/
+*.pyo
+*.pyc
+.venv/

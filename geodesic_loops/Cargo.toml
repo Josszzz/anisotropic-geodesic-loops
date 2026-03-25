@@ -1,0 +1,25 @@
+[package]
+name = "geodesic_loops"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "geodesic_loops"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+pyo3 = { version = "0.23", optional = true }
+numpy = { version = "0.23", optional = true }
+ordered-float = "4"
+
+[dev-dependencies]
+approx = "0.5"
+
+[features]
+default = []
+# Enable Python bindings (required for building the .so extension)
+python = ["dep:pyo3", "dep:numpy", "pyo3/extension-module"]
+
+[profile.release]
+opt-level = 3
+lto = true
