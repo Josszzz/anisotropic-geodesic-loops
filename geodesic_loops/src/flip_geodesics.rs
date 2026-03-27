@@ -187,24 +187,22 @@ fn seg_seg_intersect(
 // Fan unfolding
 // ────────────────────────────────────────────────────────────────
 
-/// Unfold the **CCW** fan of triangles around vertex B = dest(h_in) = origin(h_out).
+/// Unfold the **CCW** fan of triangles around vertex B.
 ///
-/// The fan sweeps CCW from `h_out` (B→C) to `twin(h_in)` (B→A).
+/// The fan sweeps CCW from `h_out` (B→C) to `h_target` (B→A).
 ///
 /// Returns `(fan_he, verts_2d)` where:
 /// * `fan_he[k]`   = k-th halfedge **from B** in fan order
 /// * `verts_2d[k]` = 2-D position of `dest(fan_he[k])`
 /// * `verts_2d[0]` = C placed at `(edge_len(h_out), 0)`
-/// * `verts_2d.last()` = A placed at accumulated angle
+/// * `verts_2d.last()` = dest(h_target) placed at accumulated angle
 fn unfold_fan_ccw(
     mesh: &HalfedgeMesh,
-    h_in: usize,   // halfedge prev_v → B
-    h_out: usize,  // halfedge B → next_v
+    b: usize,       // vertex B (placed at origin)
+    h_out: usize,   // halfedge B → next (fan start)
+    h_target: usize, // halfedge B → prev (fan end)
 ) -> Option<(Vec<usize>, Vec<[f64; 2]>)> {
-    let b = mesh.dest(h_in);
     if mesh.origin(h_out) != b { return None; }
-    let h_target = mesh.twin(h_in); // B → A
-    if h_target == INVALID { return None; }
     if mesh.is_boundary_he(h_out) { return None; }
 
     let mut fan_he: Vec<usize> = vec![h_out];
@@ -215,8 +213,6 @@ fn unfold_fan_ccw(
     for _ in 0..512 {
         if mesh.is_boundary_he(h) { return None; }
 
-        // Accumulate corner angle at B in face(h).
-        // corner_angle(h) = angle at origin(h) = B ✓
         cum += mesh.corner_angle(h);
 
         // CCW step around B: twin(prev(h))
@@ -246,13 +242,11 @@ fn unfold_fan_ccw(
 /// (vertices appear below the x-axis in the unfolded plane).
 fn unfold_fan_cw(
     mesh: &HalfedgeMesh,
-    h_in: usize,
+    b: usize,
     h_out: usize,
+    h_target: usize,
 ) -> Option<(Vec<usize>, Vec<[f64; 2]>)> {
-    let b = mesh.dest(h_in);
     if mesh.origin(h_out) != b { return None; }
-    let h_target = mesh.twin(h_in);
-    if h_target == INVALID { return None; }
 
     let mut fan_he: Vec<usize> = vec![h_out];
     let mut verts_2d: Vec<[f64; 2]> = vec![[mesh.edge_len(h_out), 0.0]];
@@ -268,7 +262,6 @@ fn unfold_fan_cw(
         if hn == INVALID { return None; }
         if mesh.origin(hn) != b { return None; }
 
-        // corner_angle(hn) = angle at B in face(twin(h)) between B→dest(hn) and B→dest(h)
         cum -= mesh.corner_angle(hn);
 
         let r = mesh.edge_len(hn);
@@ -287,10 +280,10 @@ fn unfold_fan_cw(
 }
 
 /// Given an unfolded fan, find all crossings of the straight line from
-/// `verts_2d.last()` (A) to `verts_2d[0]` (C) with the **radial** fan edges.
+/// `a2` to `c2` with the **radial** fan edges.
 ///
-/// Radial edges: from B=(0,0) to `verts_2d[k]` for k in `1..n-2`.
-/// (k=0 is B→C and k=n-1 is B→A — these are the path edges, not interior.)
+/// Radial edges: from B=(0,0) to `verts_2d[k]` for k in `1..n-1`.
+/// (k=0 and k=n-1 bound the fan — they are path edges, not interior.)
 ///
 /// Each crossing at segment-parameter `t` along B→V_k becomes a
 /// `PathPoint::Edge { v0: B, v1: V_k, t }`.  Multiple crossings are
@@ -299,12 +292,12 @@ fn find_fan_crossings(
     mesh: &HalfedgeMesh,
     fan_he: &[usize],
     verts_2d: &[[f64; 2]],
+    a2: [f64; 2],
+    c2: [f64; 2],
 ) -> Vec<PathPoint> {
     let n = verts_2d.len();
     if n < 3 { return Vec::new(); }
 
-    let a2 = verts_2d[n - 1]; // A in 2D
-    let c2 = verts_2d[0];     // C in 2D
     let b2 = [0.0f64, 0.0];   // B at origin
 
     const EPS: f64 = 1e-9;
@@ -334,37 +327,347 @@ fn find_fan_crossings(
 // Per-vertex straightening
 // ────────────────────────────────────────────────────────────────
 
+/// For an Edge-point prev on edge (ev0, ev1), find the fan target halfedge
+/// from vertex v. Returns the halfedge from v that should be the last in the
+/// fan (the later one in CCW order within the triangle {v, ev0, ev1}).
+fn fan_target_for_edge(mesh: &HalfedgeMesh, v: usize, ev0: usize, ev1: usize) -> Option<usize> {
+    // Special case: edge includes the fan center vertex
+    if ev0 == v {
+        let h = find_halfedge(mesh, v, ev1);
+        return if h != INVALID { Some(h) } else { None };
+    }
+    if ev1 == v {
+        let h = find_halfedge(mesh, v, ev0);
+        return if h != INVALID { Some(h) } else { None };
+    }
+    // Try v→ev0 in face containing ev1
+    let h = find_halfedge(mesh, v, ev0);
+    if h != INVALID && !mesh.is_boundary_he(h) && mesh.dest(mesh.next(h)) == ev1 {
+        // Face is (v, ev0, ev1). CCW step from v→ev0 gives v→ev1.
+        let hn = mesh.twin(mesh.prev(h));
+        return if hn != INVALID { Some(hn) } else { None };
+    }
+    // Try v→ev1 in face containing ev0
+    let h = find_halfedge(mesh, v, ev1);
+    if h != INVALID && !mesh.is_boundary_he(h) && mesh.dest(mesh.next(h)) == ev0 {
+        let hn = mesh.twin(mesh.prev(h));
+        return if hn != INVALID { Some(hn) } else { None };
+    }
+    None
+}
+
+/// For an Edge-point next on edge (ev0, ev1), find the fan start halfedge
+/// from vertex v. Returns the earlier halfedge from v in the triangle
+/// {v, ev0, ev1} (the one directly in the face).
+fn fan_start_for_edge(mesh: &HalfedgeMesh, v: usize, ev0: usize, ev1: usize) -> Option<usize> {
+    // Special case: edge includes the fan center vertex
+    if ev0 == v {
+        let h = find_halfedge(mesh, v, ev1);
+        return if h != INVALID { Some(h) } else { None };
+    }
+    if ev1 == v {
+        let h = find_halfedge(mesh, v, ev0);
+        return if h != INVALID { Some(h) } else { None };
+    }
+    let h = find_halfedge(mesh, v, ev0);
+    if h != INVALID && !mesh.is_boundary_he(h) && mesh.dest(mesh.next(h)) == ev1 {
+        return Some(h);
+    }
+    let h = find_halfedge(mesh, v, ev1);
+    if h != INVALID && !mesh.is_boundary_he(h) && mesh.dest(mesh.next(h)) == ev0 {
+        return Some(h);
+    }
+    None
+}
+
+/// Compute the 2-D position of an Edge point within the unfolded fan.
+/// Finds ev0 and ev1 among the fan vertex destinations and interpolates.
+/// `fan_center` is the vertex at the origin of the unfolded fan.
+fn edge_point_2d_in_fan(
+    fan_he: &[usize],
+    verts_2d: &[[f64; 2]],
+    mesh: &HalfedgeMesh,
+    ev0: usize, ev1: usize, t: f64,
+    fan_center: usize,
+) -> Option<[f64; 2]> {
+    // Special case: one edge vertex is the fan center (at origin)
+    // Edge{v0, v1, t}: pos = pos(v0) + t*(pos(v1) - pos(v0))
+    if ev0 == fan_center {
+        // pos = origin + t*(pos(ev1) - origin) = t * pos(ev1)_2d
+        let idx = fan_he.iter().position(|&h| mesh.dest(h) == ev1)?;
+        let p = verts_2d[idx];
+        return Some([t * p[0], t * p[1]]);
+    }
+    if ev1 == fan_center {
+        // pos = pos(ev0) + t*(origin - pos(ev0)) = (1-t) * pos(ev0)_2d
+        let idx = fan_he.iter().position(|&h| mesh.dest(h) == ev0)?;
+        let p = verts_2d[idx];
+        return Some([(1.0 - t) * p[0], (1.0 - t) * p[1]]);
+    }
+    // Normal case: both vertices in fan
+    let mut idx0 = None;
+    let mut idx1 = None;
+    for (k, &h) in fan_he.iter().enumerate() {
+        let d = mesh.dest(h);
+        if d == ev0 { idx0 = Some(k); }
+        if d == ev1 { idx1 = Some(k); }
+    }
+    let i0 = idx0?;
+    let i1 = idx1?;
+    let p0 = verts_2d[i0];
+    let p1 = verts_2d[i1];
+    Some([p0[0] + t * (p1[0] - p0[0]), p0[1] + t * (p1[1] - p0[1])])
+}
+
+/// Compute the 2-D position of a path endpoint in the unfolded fan.
+fn endpoint_2d(
+    pt: &PathPoint,
+    fan_he: &[usize],
+    verts_2d: &[[f64; 2]],
+    mesh: &HalfedgeMesh,
+    default_idx: usize,
+    fan_center: usize,
+) -> Option<[f64; 2]> {
+    match pt {
+        PathPoint::Vertex(_) => Some(verts_2d[default_idx]),
+        PathPoint::Edge { v0, v1, t } => {
+            edge_point_2d_in_fan(fan_he, verts_2d, mesh, *v0, *v1, *t, fan_center)
+        }
+    }
+}
+
 /// Try to straighten the path at Vertex `v` given its neighbours.
 ///
 /// Returns the replacement PathPoints (0 = already straight, 1+ = edge crossings).
-/// Currently only handles Vertex neighbours (typical after Dijkstra).
+/// Handles both Vertex and Edge-point neighbours.
 fn straighten_at_vertex(
     mesh: &HalfedgeMesh,
     prev_pt: &PathPoint,
     v: usize,
     next_pt: &PathPoint,
 ) -> Vec<PathPoint> {
-    let prev_v = match prev_pt.as_vertex() { Some(u) => u, None => return Vec::new() };
-    let next_v = match next_pt.as_vertex() { Some(u) => u, None => return Vec::new() };
-    if prev_v == v || next_v == v || prev_v == next_v { return Vec::new(); }
+    // Determine h_out (fan start) based on next_pt
+    let h_out = match next_pt {
+        PathPoint::Vertex(nv) => {
+            if *nv == v { return Vec::new(); }
+            let h = find_halfedge(mesh, v, *nv);
+            if h == INVALID { return Vec::new(); }
+            h
+        }
+        PathPoint::Edge { v0, v1, .. } => {
+            match fan_start_for_edge(mesh, v, *v0, *v1) {
+                Some(h) => h,
+                None => return Vec::new(),
+            }
+        }
+    };
 
-    let h_in  = find_halfedge(mesh, prev_v, v);
-    let h_out = find_halfedge(mesh, v, next_v);
-    if h_in == INVALID || h_out == INVALID { return Vec::new(); }
+    // Determine h_target (fan end) based on prev_pt
+    let h_target = match prev_pt {
+        PathPoint::Vertex(pv) => {
+            if *pv == v { return Vec::new(); }
+            let h_in = find_halfedge(mesh, *pv, v);
+            if h_in == INVALID { return Vec::new(); }
+            let ht = mesh.twin(h_in);
+            if ht == INVALID { return Vec::new(); }
+            ht
+        }
+        PathPoint::Edge { v0, v1, .. } => {
+            match fan_target_for_edge(mesh, v, *v0, *v1) {
+                Some(h) => h,
+                None => return Vec::new(),
+            }
+        }
+    };
+
+    if h_out == h_target { return Vec::new(); }
 
     // Try CCW fan first (left turn at v)
-    if let Some((fan_he, verts_2d)) = unfold_fan_ccw(mesh, h_in, h_out) {
-        let pts = find_fan_crossings(mesh, &fan_he, &verts_2d);
-        if !pts.is_empty() { return pts; }
+    if let Some((fan_he, verts_2d)) = unfold_fan_ccw(mesh, v, h_out, h_target) {
+        let n = verts_2d.len();
+        if let (Some(a2), Some(c2)) = (
+            endpoint_2d(prev_pt, &fan_he, &verts_2d, mesh, n - 1, v),
+            endpoint_2d(next_pt, &fan_he, &verts_2d, mesh, 0, v),
+        ) {
+            let pts = find_fan_crossings(mesh, &fan_he, &verts_2d, a2, c2);
+            if !pts.is_empty() { return pts; }
+        }
     }
 
     // Try CW fan (right turn at v)
-    if let Some((fan_he, verts_2d)) = unfold_fan_cw(mesh, h_in, h_out) {
-        let pts = find_fan_crossings(mesh, &fan_he, &verts_2d);
-        if !pts.is_empty() { return pts; }
+    if let Some((fan_he, verts_2d)) = unfold_fan_cw(mesh, v, h_out, h_target) {
+        let n = verts_2d.len();
+        if let (Some(a2), Some(c2)) = (
+            endpoint_2d(prev_pt, &fan_he, &verts_2d, mesh, n - 1, v),
+            endpoint_2d(next_pt, &fan_he, &verts_2d, mesh, 0, v),
+        ) {
+            let pts = find_fan_crossings(mesh, &fan_he, &verts_2d, a2, c2);
+            if !pts.is_empty() { return pts; }
+        }
     }
 
     Vec::new() // v is already locally straight (or a cone point)
+}
+
+// ────────────────────────────────────────────────────────────────
+// Strip unfolding optimization
+// ────────────────────────────────────────────────────────────────
+
+/// Find the vertex shared between two edges, if any.
+fn shared_vertex(e1: (usize, usize), e2: (usize, usize)) -> Option<usize> {
+    if e1.0 == e2.0 || e1.0 == e2.1 { Some(e1.0) }
+    else if e1.1 == e2.0 || e1.1 == e2.1 { Some(e1.1) }
+    else { None }
+}
+
+/// Place a new vertex across an edge in the 2D unfolded plane.
+/// The new vertex is at distance `d_a` from `ea` and `d_b` from `eb`.
+/// `above` selects which side of the edge to place it on.
+fn place_vertex_2d(
+    ea: [f64; 2], eb: [f64; 2],
+    d_a: f64, d_b: f64,
+    above: bool,
+) -> [f64; 2] {
+    let d_ab = ((eb[0] - ea[0]).powi(2) + (eb[1] - ea[1]).powi(2)).sqrt();
+    if d_ab < 1e-15 { return ea; }
+    let cos_a = (d_a * d_a + d_ab * d_ab - d_b * d_b) / (2.0 * d_a * d_ab);
+    let a = cos_a.clamp(-1.0, 1.0).acos();
+    let angle_ab = (eb[1] - ea[1]).atan2(eb[0] - ea[0]);
+    let angle = if above { angle_ab + a } else { angle_ab - a };
+    [ea[0] + d_a * angle.cos(), ea[1] + d_a * angle.sin()]
+}
+
+/// Optimize an open path segment by unfolding the entire triangle strip and
+/// finding the straight-line geodesic. This gives the globally optimal edge
+/// crossings for the given topological path (face sequence).
+fn optimize_strip(mesh: &HalfedgeMesh, path: &GeodesicPath) -> GeodesicPath {
+    if path.is_closed || path.points.len() < 3 {
+        return path.clone();
+    }
+
+    let start_v = match path.points[0].as_vertex() {
+        Some(v) => v,
+        None => return path.clone(),
+    };
+    let end_v = match path.points.last().unwrap().as_vertex() {
+        Some(v) => v,
+        None => return path.clone(),
+    };
+
+    // Collect interior edge crossings
+    let mut crossed: Vec<(usize, usize)> = Vec::new();
+    for pt in &path.points[1..path.points.len() - 1] {
+        match pt {
+            PathPoint::Edge { v0, v1, .. } => crossed.push((*v0, *v1)),
+            _ => return path.clone(),
+        }
+    }
+    if crossed.is_empty() {
+        return path.clone();
+    }
+
+    // Verify consecutive edges share a vertex (valid strip topology)
+    for w in crossed.windows(2) {
+        if shared_vertex(w[0], w[1]).is_none() {
+            return path.clone();
+        }
+    }
+
+    let nc = crossed.len();
+    let mut pos_2d = std::collections::HashMap::<usize, [f64; 2]>::new();
+
+    // Place first triangle: {start_v, crossed[0].0, crossed[0].1}
+    let (e0a, e0b) = crossed[0];
+    let d_s_a = dist3(&mesh.position(start_v), &mesh.position(e0a));
+    let d_s_b = dist3(&mesh.position(start_v), &mesh.position(e0b));
+    let d_a_b = dist3(&mesh.position(e0a), &mesh.position(e0b));
+
+    pos_2d.insert(start_v, [0.0, 0.0]);
+    pos_2d.insert(e0a, [d_s_a, 0.0]);
+    let cos_ang = (d_s_a * d_s_a + d_s_b * d_s_b - d_a_b * d_a_b) / (2.0 * d_s_a * d_s_b);
+    let ang = cos_ang.clamp(-1.0, 1.0).acos();
+    pos_2d.insert(e0b, [d_s_b * ang.cos(), d_s_b * ang.sin()]);
+
+    let mut prev_v = start_v;
+
+    for i in 0..nc {
+        let (ev0, ev1) = crossed[i];
+
+        let new_v = if i < nc - 1 {
+            let (nv0, nv1) = crossed[i + 1];
+            let shared = match shared_vertex((ev0, ev1), (nv0, nv1)) {
+                Some(s) => s,
+                None => return path.clone(),
+            };
+            if nv0 == shared { nv1 } else { nv0 }
+        } else {
+            end_v
+        };
+
+        if pos_2d.contains_key(&new_v) {
+            if i < nc - 1 {
+                let (nv0, nv1) = crossed[i + 1];
+                let shared = shared_vertex((ev0, ev1), (nv0, nv1)).unwrap();
+                prev_v = if ev0 == shared { ev1 } else { ev0 };
+            }
+            continue;
+        }
+
+        let ev0_2d = match pos_2d.get(&ev0) { Some(p) => *p, None => return path.clone() };
+        let ev1_2d = match pos_2d.get(&ev1) { Some(p) => *p, None => return path.clone() };
+        let prev_2d = match pos_2d.get(&prev_v) { Some(p) => *p, None => return path.clone() };
+
+        let d0 = dist3(&mesh.position(ev0), &mesh.position(new_v));
+        let d1 = dist3(&mesh.position(ev1), &mesh.position(new_v));
+
+        let edge_dir = sub2(ev1_2d, ev0_2d);
+        let to_prev = sub2(prev_2d, ev0_2d);
+        let prev_sign = cross2(edge_dir, to_prev);
+
+        let try_above = prev_sign < 0.0;
+        let placed = place_vertex_2d(ev0_2d, ev1_2d, d0, d1, try_above);
+        let to_placed = sub2(placed, ev0_2d);
+        let placed_sign = cross2(edge_dir, to_placed);
+
+        let final_pos = if placed_sign * prev_sign > 0.0 {
+            place_vertex_2d(ev0_2d, ev1_2d, d0, d1, !try_above)
+        } else {
+            placed
+        };
+        pos_2d.insert(new_v, final_pos);
+
+        if i < nc - 1 {
+            let (nv0, nv1) = crossed[i + 1];
+            let shared = shared_vertex((ev0, ev1), (nv0, nv1)).unwrap();
+            prev_v = if ev0 == shared { ev1 } else { ev0 };
+        }
+    }
+
+    // Compute new crossings from the straight line
+    let start_2d = pos_2d[&start_v];
+    let end_2d = match pos_2d.get(&end_v) { Some(p) => *p, None => return path.clone() };
+
+    let mut new_points = vec![PathPoint::Vertex(start_v)];
+    for i in 0..nc {
+        let (ev0, ev1) = crossed[i];
+        let ev0_2d = pos_2d[&ev0];
+        let ev1_2d = pos_2d[&ev1];
+
+        if let Some((ray_s, edge_t)) = seg_seg_intersect(start_2d, end_2d, ev0_2d, ev1_2d) {
+            let eps = 1e-12;
+            if edge_t > eps && edge_t < 1.0 - eps && ray_s > eps && ray_s < 1.0 - eps {
+                new_points.push(PathPoint::Edge { v0: ev0, v1: ev1, t: edge_t });
+            }
+        }
+    }
+    new_points.push(PathPoint::Vertex(end_v));
+
+    let result = GeodesicPath { points: new_points, is_closed: false };
+
+    // Only use the result if it's shorter
+    let old_len = path.euclidean_length(mesh);
+    let new_len = result.euclidean_length(mesh);
+    if new_len < old_len - 1e-14 { result } else { path.clone() }
 }
 
 // ────────────────────────────────────────────────────────────────
@@ -458,7 +761,14 @@ pub fn shorten_path(
         prev_len = cur_len;
     }
 
-    GeodesicPath { points: pts, is_closed }
+    let mut result = GeodesicPath { points: pts, is_closed };
+
+    // Post-process with strip unfolding for global optimization
+    if !is_closed {
+        result = optimize_strip(mesh, &result);
+    }
+
+    result
 }
 
 /// Shorten a closed geodesic loop.
