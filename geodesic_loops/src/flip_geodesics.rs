@@ -1,297 +1,464 @@
-/// Flip geodesics: Crane & Sharp (2020) "Geodesics in Heat" edge-flip shortening.
+/// Geodesic path straightening via fan unfolding.
 ///
-/// Given an initial piecewise-linear path on a mesh (as a sequence of vertices),
-/// we iteratively shorten it by flipping edges in wedges where the path makes
-/// a turn angle < π. This converges to a locally shortest geodesic.
+/// Paths are represented as sequences of `PathPoint`s — either mesh vertices
+/// or points on mesh edge interiors (given as an edge + parameter t ∈ [0,1]).
 ///
-/// This implementation works on the *extrinsic* mesh (no intrinsic
-/// triangulation refinement) to keep the code self-contained. For highly
-/// irregular meshes, running a few rounds of edge flipping toward Delaunay
-/// first would improve quality.
+/// The straightening algorithm (Polthier & Schmies 1998):
+///   For each interior Vertex p_i with Vertex neighbours p_{i-1} and p_{i+1}:
+///     1. Build the CCW (then CW) fan of triangles around p_i bounded by the
+///        incoming and outgoing path edges.
+///     2. Unfold the fan into the 2D plane.
+///     3. Find where the straight line from p_{i-1} to p_{i+1} crosses a fan edge.
+///     4. Replace p_i with that edge crossing (PathPoint::Edge).
 ///
-/// Reference:
-///   Sharp, N. and Crane, K. (2020). "You Can Find Geodesic Paths in
-///   Triangle Meshes by Just Flipping Edges". ACM Trans. Graph. 39(6).
+/// This converges to a locally-shortest geodesic whose polyline passes through
+/// edge interiors, not just along mesh edges.
 
-use crate::mesh::{HalfedgeMesh, dist3, norm3, dot3, sub3};
+use crate::mesh::{HalfedgeMesh, INVALID, dist3, sub3, dot3, norm3};
 
-// ---- angle type at a vertex of the path ----
+// ────────────────────────────────────────────────────────────────
+// PathPoint
+// ────────────────────────────────────────────────────────────────
 
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum TurnType {
-    Straight,   // angle >= π - ε at both sides → locally shortest
-    LeftTurn,   // path turns left → need to flip edges on the right wedge
-    RightTurn,  // path turns right → need to flip edges on the left wedge
+/// A point on a geodesic: at a mesh vertex or on a mesh edge interior.
+#[derive(Debug, Clone)]
+pub enum PathPoint {
+    /// At mesh vertex `v`.
+    Vertex(usize),
+    /// On the directed edge v0 → v1 at parameter t ∈ [0, 1]:
+    ///   position = positions[v0] + t * (positions[v1] − positions[v0])
+    Edge { v0: usize, v1: usize, t: f64 },
 }
 
-// ---- path representation ----
+impl PathPoint {
+    /// 3-D world position.
+    pub fn position(&self, mesh: &HalfedgeMesh) -> [f64; 3] {
+        match self {
+            PathPoint::Vertex(v) => mesh.position(*v),
+            PathPoint::Edge { v0, v1, t } => {
+                let p0 = mesh.position(*v0);
+                let p1 = mesh.position(*v1);
+                [
+                    p0[0] + t * (p1[0] - p0[0]),
+                    p0[1] + t * (p1[1] - p0[1]),
+                    p0[2] + t * (p1[2] - p0[2]),
+                ]
+            }
+        }
+    }
 
-/// A geodesic path as a sequence of vertices (may be open or closed).
+    /// Return the vertex index if this is a Vertex point.
+    pub fn as_vertex(&self) -> Option<usize> {
+        if let PathPoint::Vertex(v) = self { Some(*v) } else { None }
+    }
+}
+
+// ────────────────────────────────────────────────────────────────
+// GeodesicPath
+// ────────────────────────────────────────────────────────────────
+
+/// A geodesic path as a sequence of `PathPoint`s.
+///
+/// For a **closed** loop the last point is NOT repeated; the segment from
+/// `points.last()` back to `points[0]` closes the loop implicitly.
 #[derive(Debug, Clone)]
 pub struct GeodesicPath {
-    /// Ordered vertices along the path.  For a closed loop, `vertices[0]`
-    /// is NOT repeated at the end; the edge from `vertices.last()` back to
-    /// `vertices[0]` closes the loop.
-    pub vertices: Vec<usize>,
+    pub points: Vec<PathPoint>,
     pub is_closed: bool,
 }
 
 impl GeodesicPath {
+    /// Construct an open path from a vertex sequence (e.g. from Dijkstra).
     pub fn open(vertices: Vec<usize>) -> Self {
-        Self { vertices, is_closed: false }
+        Self {
+            points: vertices.into_iter().map(PathPoint::Vertex).collect(),
+            is_closed: false,
+        }
     }
+
+    /// Construct a closed loop from a vertex sequence.
     pub fn closed(vertices: Vec<usize>) -> Self {
-        Self { vertices, is_closed: true }
+        Self {
+            points: vertices.into_iter().map(PathPoint::Vertex).collect(),
+            is_closed: true,
+        }
     }
 
-    pub fn len(&self) -> usize { self.vertices.len() }
+    pub fn len(&self) -> usize { self.points.len() }
+    pub fn is_empty(&self) -> bool { self.points.is_empty() }
 
-    /// Metric length of the path on the mesh
-    pub fn metric_length(&self, mesh: &HalfedgeMesh) -> f64 {
-        crate::geodesic::path_metric_length(mesh, &self.vertices)
-            + if self.is_closed && self.vertices.len() >= 2 {
-                let last = *self.vertices.last().unwrap();
-                let first = self.vertices[0];
-                if last == first { 0.0 } else { metric_edge_len_between(mesh, last, first) }
-            } else { 0.0 }
+    /// Vertex indices only (Vertex points; Edge points are skipped).
+    pub fn vertex_indices(&self) -> Vec<usize> {
+        self.points.iter().filter_map(|p| p.as_vertex()).collect()
     }
 
-    /// Convert to 3-D polyline
+    /// `(v0, v1, t)` for every point.  `Vertex(v)` maps to `(v, v, 0.0)`.
+    pub fn edge_params(&self) -> Vec<(usize, usize, f64)> {
+        self.points.iter().map(|p| match p {
+            PathPoint::Vertex(v) => (*v, *v, 0.0),
+            PathPoint::Edge { v0, v1, t } => (*v0, *v1, *t),
+        }).collect()
+    }
+
+    /// 3-D polyline coordinates.  For closed paths the first point is
+    /// appended at the end to close the polygon.
     pub fn to_polyline(&self, mesh: &HalfedgeMesh) -> Vec<[f64; 3]> {
-        let mut pts: Vec<[f64; 3]> = self.vertices.iter().map(|&v| mesh.position(v)).collect();
-        if self.is_closed {
+        let mut pts: Vec<[f64; 3]> = self.points.iter()
+            .map(|p| p.position(mesh)).collect();
+        if self.is_closed && !pts.is_empty() {
             pts.push(pts[0]);
         }
         pts
     }
+
+    /// Euclidean 3-D path length (sum of straight-line segment distances).
+    pub fn euclidean_length(&self, mesh: &HalfedgeMesh) -> f64 {
+        let pts: Vec<[f64; 3]> = self.points.iter()
+            .map(|p| p.position(mesh)).collect();
+        let n = pts.len();
+        if n < 2 { return 0.0; }
+        let mut total: f64 = (0..n - 1).map(|i| dist3(&pts[i], &pts[i + 1])).sum();
+        if self.is_closed { total += dist3(&pts[n - 1], &pts[0]); }
+        total
+    }
+
+    /// Metric length.  For pure-vertex paths the mesh edge weights are used;
+    /// for paths with edge crossings the Euclidean length is returned
+    /// (exact for the Euclidean metric, approximate otherwise).
+    pub fn metric_length(&self, mesh: &HalfedgeMesh) -> f64 {
+        if self.points.iter().all(|p| p.as_vertex().is_some()) {
+            let verts = self.vertex_indices();
+            let base = crate::geodesic::path_metric_length(mesh, &verts);
+            let close = if self.is_closed && verts.len() >= 2 {
+                let l = *verts.last().unwrap();
+                let f = verts[0];
+                if l == f { 0.0 } else { metric_edge_len_between(mesh, l, f) }
+            } else {
+                0.0
+            };
+            base + close
+        } else {
+            self.euclidean_length(mesh)
+        }
+    }
 }
 
-/// Return the metric edge length between adjacent vertices u and v.
-/// Returns infinity if there is no direct edge (vertices are not neighbours).
+// ────────────────────────────────────────────────────────────────
+// Internal mesh helpers
+// ────────────────────────────────────────────────────────────────
+
 fn metric_edge_len_between(mesh: &HalfedgeMesh, u: usize, v: usize) -> f64 {
     for h in mesh.outgoing_halfedges(u) {
-        if mesh.dest(h) == v {
-            return mesh.metric_edge_len(h);
+        if mesh.dest(h) == v { return mesh.metric_edge_len(h); }
+    }
+    f64::INFINITY
+}
+
+/// Find the halfedge u → v, or INVALID.
+fn find_halfedge(mesh: &HalfedgeMesh, u: usize, v: usize) -> usize {
+    for h in mesh.outgoing_halfedges(u) {
+        if mesh.dest(h) == v { return h; }
+    }
+    INVALID
+}
+
+// ────────────────────────────────────────────────────────────────
+// 2-D geometry helpers
+// ────────────────────────────────────────────────────────────────
+
+#[inline] fn cross2(a: [f64; 2], b: [f64; 2]) -> f64 { a[0]*b[1] - a[1]*b[0] }
+#[inline] fn sub2(a: [f64; 2], b: [f64; 2]) -> [f64; 2] { [a[0]-b[0], a[1]-b[1]] }
+
+/// Intersect segment [p,q] with segment [s,t].
+/// Returns `(r, u)` where r is the parameter along p→q and u along s→t.
+fn seg_seg_intersect(
+    p: [f64; 2], q: [f64; 2],
+    s: [f64; 2], t: [f64; 2],
+) -> Option<(f64, f64)> {
+    let d = sub2(q, p);
+    let e = sub2(t, s);
+    let denom = cross2(d, e);
+    if denom.abs() < 1e-14 { return None; }
+    let f = sub2(s, p);
+    Some((cross2(f, e) / denom, cross2(f, d) / denom))
+}
+
+// ────────────────────────────────────────────────────────────────
+// Fan unfolding
+// ────────────────────────────────────────────────────────────────
+
+/// Unfold the **CCW** fan of triangles around vertex B = dest(h_in) = origin(h_out).
+///
+/// The fan sweeps CCW from `h_out` (B→C) to `twin(h_in)` (B→A).
+///
+/// Returns `(fan_he, verts_2d)` where:
+/// * `fan_he[k]`   = k-th halfedge **from B** in fan order
+/// * `verts_2d[k]` = 2-D position of `dest(fan_he[k])`
+/// * `verts_2d[0]` = C placed at `(edge_len(h_out), 0)`
+/// * `verts_2d.last()` = A placed at accumulated angle
+fn unfold_fan_ccw(
+    mesh: &HalfedgeMesh,
+    h_in: usize,   // halfedge prev_v → B
+    h_out: usize,  // halfedge B → next_v
+) -> Option<(Vec<usize>, Vec<[f64; 2]>)> {
+    let b = mesh.dest(h_in);
+    if mesh.origin(h_out) != b { return None; }
+    let h_target = mesh.twin(h_in); // B → A
+    if h_target == INVALID { return None; }
+    if mesh.is_boundary_he(h_out) { return None; }
+
+    let mut fan_he: Vec<usize> = vec![h_out];
+    let mut verts_2d: Vec<[f64; 2]> = vec![[mesh.edge_len(h_out), 0.0]];
+    let mut cum = 0.0f64;
+    let mut h = h_out;
+
+    for _ in 0..512 {
+        if mesh.is_boundary_he(h) { return None; }
+
+        // Accumulate corner angle at B in face(h).
+        // corner_angle(h) = angle at origin(h) = B ✓
+        cum += mesh.corner_angle(h);
+
+        // CCW step around B: twin(prev(h))
+        let ph = mesh.prev(h);
+        if ph == INVALID { return None; }
+        let hn = mesh.twin(ph);
+        if hn == INVALID { return None; }
+
+        let r = mesh.edge_len(hn);
+        verts_2d.push([r * cum.cos(), r * cum.sin()]);
+        fan_he.push(hn);
+
+        if hn == h_target { break; }
+        h = hn;
+        if fan_he.len() > 512 { return None; }
+    }
+
+    if fan_he.last().copied() != Some(h_target) || fan_he.len() < 2 {
+        return None;
+    }
+    Some((fan_he, verts_2d))
+}
+
+/// Unfold the **CW** fan of triangles around B.
+///
+/// Same as CCW but traverses the opposite side; angles accumulate negatively
+/// (vertices appear below the x-axis in the unfolded plane).
+fn unfold_fan_cw(
+    mesh: &HalfedgeMesh,
+    h_in: usize,
+    h_out: usize,
+) -> Option<(Vec<usize>, Vec<[f64; 2]>)> {
+    let b = mesh.dest(h_in);
+    if mesh.origin(h_out) != b { return None; }
+    let h_target = mesh.twin(h_in);
+    if h_target == INVALID { return None; }
+
+    let mut fan_he: Vec<usize> = vec![h_out];
+    let mut verts_2d: Vec<[f64; 2]> = vec![[mesh.edge_len(h_out), 0.0]];
+    let mut cum = 0.0f64;
+    let mut h = h_out;
+
+    for _ in 0..512 {
+        // CW step around B: next(twin(h))
+        let th = mesh.twin(h);
+        if th == INVALID { return None; }
+        if mesh.is_boundary_he(th) { return None; }
+        let hn = mesh.next(th);
+        if hn == INVALID { return None; }
+        if mesh.origin(hn) != b { return None; }
+
+        // corner_angle(hn) = angle at B in face(twin(h)) between B→dest(hn) and B→dest(h)
+        cum -= mesh.corner_angle(hn);
+
+        let r = mesh.edge_len(hn);
+        verts_2d.push([r * cum.cos(), r * cum.sin()]);
+        fan_he.push(hn);
+
+        if hn == h_target { break; }
+        h = hn;
+        if fan_he.len() > 512 { return None; }
+    }
+
+    if fan_he.last().copied() != Some(h_target) || fan_he.len() < 2 {
+        return None;
+    }
+    Some((fan_he, verts_2d))
+}
+
+/// Given an unfolded fan, find all crossings of the straight line from
+/// `verts_2d.last()` (A) to `verts_2d[0]` (C) with the **radial** fan edges.
+///
+/// Radial edges: from B=(0,0) to `verts_2d[k]` for k in `1..n-2`.
+/// (k=0 is B→C and k=n-1 is B→A — these are the path edges, not interior.)
+///
+/// Each crossing at segment-parameter `t` along B→V_k becomes a
+/// `PathPoint::Edge { v0: B, v1: V_k, t }`.  Multiple crossings are
+/// returned sorted by `ray_s` (order A→C along the geodesic).
+fn find_fan_crossings(
+    mesh: &HalfedgeMesh,
+    fan_he: &[usize],
+    verts_2d: &[[f64; 2]],
+) -> Vec<PathPoint> {
+    let n = verts_2d.len();
+    if n < 3 { return Vec::new(); }
+
+    let a2 = verts_2d[n - 1]; // A in 2D
+    let c2 = verts_2d[0];     // C in 2D
+    let b2 = [0.0f64, 0.0];   // B at origin
+
+    const EPS: f64 = 1e-9;
+    let mut hits: Vec<(f64, PathPoint)> = Vec::new();
+
+    // Check each radial edge B → verts_2d[k] for interior k
+    for k in 1..n - 1 {
+        let vk = verts_2d[k];
+
+        if let Some((ray_s, seg_t)) = seg_seg_intersect(a2, c2, b2, vk) {
+            if ray_s > EPS && ray_s < 1.0 - EPS && seg_t > EPS && seg_t < 1.0 - EPS {
+                // fan_he[k] is the halfedge B → V_k
+                let h = fan_he[k];
+                let v0 = mesh.origin(h); // B
+                let v1 = mesh.dest(h);   // V_k
+                hits.push((ray_s, PathPoint::Edge { v0, v1, t: seg_t }));
+            }
         }
     }
-    f64::INFINITY  // no direct mesh edge
+
+    // Sort by ray_s so crossings are ordered A → C
+    hits.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+    hits.into_iter().map(|(_, pt)| pt).collect()
 }
 
-// ---- turn angle at a vertex ----
+// ────────────────────────────────────────────────────────────────
+// Per-vertex straightening
+// ────────────────────────────────────────────────────────────────
 
-/// Compute the turn angle of the path at interior vertex `v`,
-/// where the path comes in via vertex `prev_v` and goes out via `next_v`.
+/// Try to straighten the path at Vertex `v` given its neighbours.
 ///
-/// Returns `(left_angle, right_angle)` — the angular gaps on each side.
-/// A locally-shortest path has both angles >= π - ε.
-pub fn wedge_angles(
+/// Returns the replacement PathPoints (0 = already straight, 1+ = edge crossings).
+/// Currently only handles Vertex neighbours (typical after Dijkstra).
+fn straighten_at_vertex(
     mesh: &HalfedgeMesh,
-    prev_v: usize,
+    prev_pt: &PathPoint,
     v: usize,
-    next_v: usize,
-) -> (f64, f64) {
-    // We use actual 3-D geometry: compute the angle in the tangent plane
-    // of the surface at v between the two edges v→prev and v→next.
-    // For a flat mesh this is exact; for curved meshes it's approximate.
-    //
-    // More precisely, we unfold the two triangles incident to the path
-    // at this vertex to compute the intrinsic angle.
-    let pv = mesh.position(v);
-    let pp = mesh.position(prev_v);
-    let pn = mesh.position(next_v);
+    next_pt: &PathPoint,
+) -> Vec<PathPoint> {
+    let prev_v = match prev_pt.as_vertex() { Some(u) => u, None => return Vec::new() };
+    let next_v = match next_pt.as_vertex() { Some(u) => u, None => return Vec::new() };
+    if prev_v == v || next_v == v || prev_v == next_v { return Vec::new(); }
 
-    let dp = sub3(&pp, &pv);
-    let dn = sub3(&pn, &pv);
+    let h_in  = find_halfedge(mesh, prev_v, v);
+    let h_out = find_halfedge(mesh, v, next_v);
+    if h_in == INVALID || h_out == INVALID { return Vec::new(); }
 
-    let angle_between = {
-        let cos_a = dot3(&dp, &dn) / (norm3(&dp) * norm3(&dn) + 1e-30);
-        cos_a.clamp(-1.0, 1.0).acos()
-    };
+    // Try CCW fan first (left turn at v)
+    if let Some((fan_he, verts_2d)) = unfold_fan_ccw(mesh, h_in, h_out) {
+        let pts = find_fan_crossings(mesh, &fan_he, &verts_2d);
+        if !pts.is_empty() { return pts; }
+    }
 
-    let angle_sum = mesh.vertex_angle_sum(v);
+    // Try CW fan (right turn at v)
+    if let Some((fan_he, verts_2d)) = unfold_fan_cw(mesh, h_in, h_out) {
+        let pts = find_fan_crossings(mesh, &fan_he, &verts_2d);
+        if !pts.is_empty() { return pts; }
+    }
 
-    // The two sides of the wedge: the angle going one way and the other
-    // around the vertex.
-    let left  = angle_between;
-    let right = (angle_sum - angle_between).abs();
-
-    (left, right)
+    Vec::new() // v is already locally straight (or a cone point)
 }
 
-/// Classify the turn type at v given incoming edge prev→v and outgoing v→next.
-pub fn classify_turn(
-    mesh: &HalfedgeMesh,
-    prev_v: usize,
-    v: usize,
-    next_v: usize,
-    eps: f64,
-) -> (TurnType, f64) {
-    let (left, right) = wedge_angles(mesh, prev_v, v, next_v);
-    let min_angle = left.min(right);
-    if min_angle >= std::f64::consts::PI - eps {
-        (TurnType::Straight, min_angle)
-    } else if left < right {
-        (TurnType::LeftTurn, left)
-    } else {
-        (TurnType::RightTurn, right)
-    }
-}
+// ────────────────────────────────────────────────────────────────
+// Configuration
+// ────────────────────────────────────────────────────────────────
 
-// ---- wedge edge-flip ----
-
-/// Attempt to locally shorten the path at vertex `v` by flipping edges
-/// in the smaller wedge.  Returns true if a flip was performed.
-///
-/// The path is represented as a mutable vertex list. We only modify the
-/// segment around `v` (indices `idx-1 .. idx+1` in the vertex list, or
-/// wrapped for closed loops).
-///
-/// The algorithm:
-///   1. Find the wedge (the set of edges between the two path edges at v)
-///   2. If the wedge angle < π, find a diagonal crossing the wedge that
-///      shortens the path
-///   3. Replace the two-step path through v with a one-step shortcut through
-///      the new diagonal vertex
-fn try_shorten_at(
-    mesh: &HalfedgeMesh,
-    vertices: &mut Vec<usize>,
-    idx: usize,
-    is_closed: bool,
-    eps: f64,
-) -> bool {
-    let n = vertices.len();
-    if n < 3 { return false; }
-
-    let prev_idx = if idx == 0 {
-        if is_closed { n - 1 } else { return false; }
-    } else { idx - 1 };
-
-    let next_idx = if idx == n - 1 {
-        if is_closed { 0 } else { return false; }
-    } else { idx + 1 };
-
-    let prev_v = vertices[prev_idx];
-    let v = vertices[idx];
-    let next_v = vertices[next_idx];
-
-    let (turn_type, min_angle) = classify_turn(mesh, prev_v, v, next_v, eps);
-    if turn_type == TurnType::Straight { return false; }
-
-    // Find edges in the wedge: walk around v CCW from the outgoing edge v→next_v
-    // to the incoming edge v→prev_v (using the smaller angular gap).
-    // Look for a shortcut: a vertex w adjacent to v such that the path
-    // prev_v→w→next_v is shorter than prev_v→v→next_v.
-    let d_prev_v  = metric_edge_len_between(mesh, prev_v, v);
-    let d_v_next  = metric_edge_len_between(mesh, v, next_v);
-    let current_len = d_prev_v + d_v_next;
-
-    let mut best_len = current_len;
-    let mut best_w: Option<usize> = None;
-
-    // Check all neighbors of v
-    for h in mesh.outgoing_halfedges(v) {
-        let w = mesh.dest(h);
-        if w == prev_v || w == next_v || w >= mesh.n_verts() { continue; }
-
-        // w must be inside the wedge: check if inserting w shortens the path
-        let d_prev_w = metric_edge_len_between(mesh, prev_v, w);
-        let d_w_next = metric_edge_len_between(mesh, w, next_v);
-        if d_prev_w.is_infinite() || d_w_next.is_infinite() { continue; }
-
-        let candidate_len = d_prev_w + d_w_next;
-        if candidate_len < best_len - 1e-12 {
-            best_len = candidate_len;
-            best_w = Some(w);
-        }
-    }
-
-    // Also try removing v entirely: direct edge prev_v → next_v
-    let d_direct = metric_edge_len_between(mesh, prev_v, next_v);
-    if d_direct < best_len - 1e-12 {
-        vertices.remove(idx);
-        return true;
-    }
-
-    if let Some(w) = best_w {
-        // Replace v with w
-        vertices[idx] = w;
-        return true;
-    }
-
-    false
-}
-
-// ---- main shortening loop ----
-
-/// Configuration for the flip geodesic shortening.
 #[derive(Debug, Clone)]
 pub struct FlipConfig {
-    /// Maximum number of shortening iterations
     pub max_iterations: usize,
-    /// Convergence tolerance: stop when relative length decrease < this
     pub rel_tol: f64,
-    /// Angle tolerance for "straight" classification
+    /// Kept for API compatibility; unused in the unfolding algorithm.
     pub angle_eps: f64,
 }
 
 impl Default for FlipConfig {
     fn default() -> Self {
-        Self {
-            max_iterations: 10_000,
-            rel_tol: 1e-8,
-            angle_eps: 1e-6,
-        }
+        Self { max_iterations: 10_000, rel_tol: 1e-9, angle_eps: 1e-6 }
     }
 }
 
-/// Shorten a geodesic path by iterative vertex-replacement at turn vertices.
-///
-/// This is a combinatorial analogue of the flip geodesic algorithm:
-/// at each turn vertex we search the neighbourhood for a shorter route.
-/// Converges to a locally shortest path in the combinatorial graph.
+// ────────────────────────────────────────────────────────────────
+// Main shortening loop
+// ────────────────────────────────────────────────────────────────
+
+/// Shorten a geodesic path by iteratively replacing interior Vertex points
+/// with edge-crossing PathPoints via fan unfolding.
 pub fn shorten_path(
     mesh: &HalfedgeMesh,
     path: &GeodesicPath,
     config: &FlipConfig,
 ) -> GeodesicPath {
-    let mut vertices = path.vertices.clone();
+    let mut pts = path.points.clone();
     let is_closed = path.is_closed;
 
+    if pts.len() < 3 {
+        return path.clone();
+    }
+
     let mut prev_len = f64::INFINITY;
-    let mut iter = 0;
 
-    loop {
-        if iter >= config.max_iterations { break; }
-        iter += 1;
-
-        let n = vertices.len();
-        if n < 2 { break; }
+    for _iter in 0..config.max_iterations {
+        let n = pts.len();
+        if n < 3 { break; }
 
         let mut changed = false;
+
         let mut i = 0;
-        while i < vertices.len() {
-            if try_shorten_at(mesh, &mut vertices, i, is_closed, config.angle_eps) {
-                changed = true;
-                // Don't advance i — re-check same position after removal/replacement
+        while i < pts.len() {
+            let n_cur = pts.len();
+            if n_cur < 3 { break; }
+
+            // Determine indices, accounting for closed paths
+            let (prev_i, cur_i, next_i) = if is_closed {
+                let c = i % n_cur;
+                let p = if c == 0 { n_cur - 1 } else { c - 1 };
+                let nx = if c == n_cur - 1 { 0 } else { c + 1 };
+                (p, c, nx)
             } else {
-                i += 1;
+                if i == 0 || i >= n_cur - 1 { i += 1; continue; }
+                (i - 1, i, i + 1)
+            };
+
+            // Only straighten at Vertex points
+            let v = match &pts[cur_i] {
+                PathPoint::Vertex(v) => *v,
+                _ => { i += 1; continue; }
+            };
+
+            let prev_pt = pts[prev_i].clone();
+            let next_pt = pts[next_i].clone();
+
+            let replacements = straighten_at_vertex(mesh, &prev_pt, v, &next_pt);
+            if !replacements.is_empty() {
+                let rep_len = replacements.len();
+                pts.splice(cur_i..=cur_i, replacements.into_iter());
+                changed = true;
+                // Skip the newly-inserted edge points (they aren't Vertex points)
+                i = cur_i + rep_len;
+                continue;
             }
+
+            i += 1;
         }
 
-        // Compute current length
-        let cur_len = GeodesicPath { vertices: vertices.clone(), is_closed }
-            .metric_length(mesh);
+        let cur_len = GeodesicPath { points: pts.clone(), is_closed }
+            .euclidean_length(mesh);
 
         if cur_len < 1e-15 { break; }
-
-        let rel_decrease = (prev_len - cur_len).abs() / cur_len;
-        if !changed || rel_decrease < config.rel_tol {
-            break;
-        }
+        let rel_dec = (prev_len - cur_len) / prev_len.max(cur_len);
+        if !changed || rel_dec.abs() < config.rel_tol { break; }
         prev_len = cur_len;
     }
 
-    GeodesicPath { vertices, is_closed }
+    GeodesicPath { points: pts, is_closed }
 }
 
 /// Shorten a closed geodesic loop.
@@ -304,21 +471,10 @@ pub fn shorten_loop(
     shorten_path(mesh, path, config)
 }
 
-// ---- Intrinsic edge-flip Delaunay refinement ----
+// ────────────────────────────────────────────────────────────────
+// High-level API
+// ────────────────────────────────────────────────────────────────
 
-/// Check whether edge h satisfies the (extrinsic) Delaunay condition:
-/// the sum of opposite angles < π.
-pub fn is_delaunay_edge(mesh: &HalfedgeMesh, h: usize) -> bool {
-    if mesh.is_boundary_edge(h) { return true; }
-    let t = mesh.twin(h);
-    let alpha = mesh.corner_angle(mesh.next(h));  // opposite angle in face of h
-    let beta  = mesh.corner_angle(mesh.next(t));  // opposite angle in face of twin
-    alpha + beta <= std::f64::consts::PI + 1e-10
-}
-
-// ---- higher-level API ----
-
-/// Compute and shorten a point-to-point geodesic from `src` to `dst`.
 pub fn geodesic_path(
     mesh: &HalfedgeMesh,
     src: usize,
@@ -326,22 +482,18 @@ pub fn geodesic_path(
     config: &FlipConfig,
 ) -> Option<GeodesicPath> {
     let vpath = crate::geodesic::shortest_path(mesh, src, dst)?;
-    let path = GeodesicPath::open(vpath);
-    Some(shorten_path(mesh, &path, config))
+    Some(shorten_path(mesh, &GeodesicPath::open(vpath), config))
 }
 
-/// Compute and shorten the shortest non-contractible closed geodesic through `seed`.
 pub fn geodesic_loop(
     mesh: &HalfedgeMesh,
     seed: usize,
     config: &FlipConfig,
 ) -> Option<GeodesicPath> {
     let vloop = crate::geodesic::shortest_loop_through(mesh, seed)?;
-    let path = GeodesicPath::closed(vloop);
-    Some(shorten_loop(mesh, &path, config))
+    Some(shorten_loop(mesh, &GeodesicPath::closed(vloop), config))
 }
 
-/// Compute a geodesic loop in a homotopy class defined by a cut.
 pub fn geodesic_loop_with_cut(
     mesh: &HalfedgeMesh,
     seed: usize,
@@ -349,44 +501,92 @@ pub fn geodesic_loop_with_cut(
     config: &FlipConfig,
 ) -> Option<GeodesicPath> {
     let vloop = crate::geodesic::shortest_loop_crossing_cut(mesh, seed, cut_edges)?;
-    let path = GeodesicPath::closed(vloop);
-    Some(shorten_loop(mesh, &path, config))
+    Some(shorten_loop(mesh, &GeodesicPath::closed(vloop), config))
 }
 
-// ---- statistics ----
+// ────────────────────────────────────────────────────────────────
+// Statistics (kept for Python API compatibility)
+// ────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone)]
 pub struct GeodesicStats {
     pub length: f64,
-    pub n_vertices: usize,
+    pub n_points: usize,
     pub is_closed: bool,
+    /// Min angle at vertex points (radians). f64::INFINITY if no vertex turns.
     pub min_angle: f64,
+    /// Max angle at vertex points (radians).
     pub max_angle: f64,
 }
 
 pub fn compute_stats(mesh: &HalfedgeMesh, path: &GeodesicPath) -> GeodesicStats {
-    let n = path.vertices.len();
+    let length = path.metric_length(mesh);
+    let n = path.points.len();
     let mut min_angle = f64::INFINITY;
     let mut max_angle = 0.0f64;
 
-    let range = if path.is_closed { 0..n } else { 1..(n-1) };
+    let range: Box<dyn Iterator<Item = usize>> = if path.is_closed {
+        Box::new(0..n)
+    } else {
+        Box::new(1..n.saturating_sub(1))
+    };
+
     for i in range {
         let prev_i = if i == 0 { n - 1 } else { i - 1 };
         let next_i = if i == n - 1 { 0 } else { i + 1 };
-        let pv = path.vertices[prev_i];
-        let v  = path.vertices[i];
-        let nv = path.vertices[next_i];
-        let (left, right) = wedge_angles(mesh, pv, v, nv);
-        let ma = left.min(right);
-        min_angle = min_angle.min(ma);
-        max_angle = max_angle.max(ma);
+        if let (Some(pv), Some(v), Some(nv)) = (
+            path.points[prev_i].as_vertex(),
+            path.points[i].as_vertex(),
+            path.points[next_i].as_vertex(),
+        ) {
+            let (l, r) = wedge_angles(mesh, pv, v, nv);
+            let ma = l.min(r);
+            min_angle = min_angle.min(ma);
+            max_angle = max_angle.max(ma);
+        }
     }
 
-    GeodesicStats {
-        length: path.metric_length(mesh),
-        n_vertices: n,
-        is_closed: path.is_closed,
-        min_angle,
-        max_angle,
-    }
+    GeodesicStats { length, n_points: n, is_closed: path.is_closed, min_angle, max_angle }
+}
+
+// ────────────────────────────────────────────────────────────────
+// Angle utilities (kept for stats / backward compat)
+// ────────────────────────────────────────────────────────────────
+
+pub fn wedge_angles(
+    mesh: &HalfedgeMesh,
+    prev_v: usize, v: usize, next_v: usize,
+) -> (f64, f64) {
+    let pv = mesh.position(v);
+    let pp = mesh.position(prev_v);
+    let pn = mesh.position(next_v);
+    let dp = sub3(&pp, &pv);
+    let dn = sub3(&pn, &pv);
+    let cos_a = dot3(&dp, &dn) / (norm3(&dp) * norm3(&dn) + 1e-30);
+    let angle_between = cos_a.clamp(-1.0, 1.0).acos();
+    let angle_sum = mesh.vertex_angle_sum(v);
+    (angle_between, (angle_sum - angle_between).abs())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum TurnType { Straight, LeftTurn, RightTurn }
+
+pub fn classify_turn(
+    mesh: &HalfedgeMesh,
+    prev_v: usize, v: usize, next_v: usize,
+    eps: f64,
+) -> (TurnType, f64) {
+    let (left, right) = wedge_angles(mesh, prev_v, v, next_v);
+    let min_angle = left.min(right);
+    if min_angle >= std::f64::consts::PI - eps { (TurnType::Straight, min_angle) }
+    else if left < right { (TurnType::LeftTurn, left) }
+    else { (TurnType::RightTurn, right) }
+}
+
+pub fn is_delaunay_edge(mesh: &HalfedgeMesh, h: usize) -> bool {
+    if mesh.is_boundary_edge(h) { return true; }
+    let t = mesh.twin(h);
+    let alpha = mesh.corner_angle(mesh.next(h));
+    let beta  = mesh.corner_angle(mesh.next(t));
+    alpha + beta <= std::f64::consts::PI + 1e-10
 }

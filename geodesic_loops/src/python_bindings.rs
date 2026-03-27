@@ -145,10 +145,32 @@ pub struct PyGeodesicPath {
 
 #[pymethods]
 impl PyGeodesicPath {
-    /// Vertex indices along the path as int64 array.
+    /// Vertex indices for pure-Vertex path points as int64 array.
+    /// Edge-crossing points are skipped; use `edge_params()` for the full path.
     fn vertices<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray1<i64>> {
-        let v: Vec<i64> = self.path.vertices.iter().map(|&x| x as i64).collect();
+        let v: Vec<i64> = self.path.vertex_indices().iter().map(|&x| x as i64).collect();
         PyArray1::from_vec(py, v)
+    }
+
+    /// Edge-parameter representation of all path points as an (N, 3) int/float array.
+    ///
+    /// Each row is ``[v0, v1, t]`` where the point is at
+    /// ``positions[v0] + t * (positions[v1] - positions[v0])``.
+    /// For a Vertex point, ``v0 == v1`` and ``t == 0``.
+    ///
+    /// Returns a Python list of (v0: int, v1: int, t: float) tuples.
+    fn edge_params<'py>(&self, py: Python<'py>) -> PyObject {
+        let params = self.path.edge_params();
+        let list = pyo3::types::PyList::empty(py);
+        for (v0, v1, t) in params {
+            let tup = pyo3::types::PyTuple::new(py, &[
+                v0.into_pyobject(py).unwrap().into_any().unbind(),
+                v1.into_pyobject(py).unwrap().into_any().unbind(),
+                t.into_pyobject(py).unwrap().into_any().unbind(),
+            ]).unwrap();
+            list.append(tup).unwrap();
+        }
+        list.into()
     }
 
     #[getter] fn is_closed(&self) -> bool { self.path.is_closed }
@@ -169,7 +191,7 @@ impl PyGeodesicPath {
         let s = crate::flip_geodesics::compute_stats(&mesh.mesh, &self.path);
         let d = pyo3::types::PyDict::new(py);
         d.set_item("length", s.length).unwrap();
-        d.set_item("n_vertices", s.n_vertices).unwrap();
+        d.set_item("n_vertices", s.n_points).unwrap();
         d.set_item("is_closed", s.is_closed).unwrap();
         d.set_item("min_angle_rad", s.min_angle).unwrap();
         d.set_item("max_angle_rad", s.max_angle).unwrap();

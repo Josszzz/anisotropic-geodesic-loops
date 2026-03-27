@@ -283,6 +283,32 @@ mod flip_tests {
         // Each edge has length 1, so total = 4
         assert!((len - 4.0).abs() < 1e-10, "expected length 4, got {}", len);
     }
+
+    #[test]
+    fn shortening_produces_edge_crossings() {
+        // On a 6×6 flat grid, vertex (i,j) = i*6+j.
+        // Path 0=(0,0) → 7=(1,1) → 13=(2,1): this detours via (1,1).
+        // The true geodesic from (0,0) to (2,1) has length sqrt(5)≈2.236.
+        // After shortening, the path should contain at least one Edge crossing.
+        let n = 6usize;
+        let m = flat_grid(n);
+        let config = FlipConfig::default();
+        let path = GeodesicPath::open(vec![0, 7, 13]);
+        let shortened = shorten_path(&m, &path, &config);
+
+        // Must contain at least one interior edge-crossing point
+        let has_edge_pt = shortened.points.iter().any(|p| {
+            use crate::flip_geodesics::PathPoint;
+            matches!(p, PathPoint::Edge { v0, v1, .. } if v0 != v1)
+        });
+        assert!(has_edge_pt, "expected edge crossings but got: {:?}", shortened.points);
+
+        // Length must converge toward sqrt(5)
+        let len = shortened.euclidean_length(&m);
+        let expected = 5.0f64.sqrt();
+        assert!(len <= expected * 1.01 + 1e-8,
+            "final length {} should be close to sqrt(5)={}", len, expected);
+    }
 }
 
 #[cfg(test)]
