@@ -513,6 +513,61 @@ fn straighten_at_vertex(
 // Strip unfolding optimization
 // ────────────────────────────────────────────────────────────────
 
+/// Convert a vertex path into a sequence of crossed edges by collecting
+/// the interior radial edges from each intermediate vertex's fan.
+/// This allows strip unfolding to optimize paths that Dijkstra found
+/// along mesh boundaries (where per-vertex shortening can't improve).
+fn vertex_path_to_crossed_edges(
+    mesh: &HalfedgeMesh,
+    vpath: &[usize],
+) -> Option<Vec<(usize, usize)>> {
+    if vpath.len() < 3 { return None; }
+
+    let mut crossed = Vec::new();
+
+    for i in 1..vpath.len() - 1 {
+        let prev_v = vpath[i - 1];
+        let v = vpath[i];
+        let next_v = vpath[i + 1];
+        if prev_v == v || next_v == v { return None; }
+
+        let h_out = find_halfedge(mesh, v, next_v);
+        if h_out == INVALID { return None; }
+        let h_in = find_halfedge(mesh, prev_v, v);
+        if h_in == INVALID { return None; }
+        let h_target = mesh.twin(h_in);
+        if h_target == INVALID { return None; }
+        if h_out == h_target { continue; }
+
+        // Try CCW then CW fan
+        let fan_he = if let Some((fan, _)) = unfold_fan_ccw(mesh, v, h_out, h_target) {
+            fan
+        } else if let Some((fan, _)) = unfold_fan_cw(mesh, v, h_out, h_target) {
+            fan
+        } else {
+            return None;
+        };
+
+        // Collect interior radial edges in REVERSE order (from h_target side toward
+        // h_out side) so they appear in strip order (start → end).
+        for k in (1..fan_he.len() - 1).rev() {
+            let h = fan_he[k];
+            crossed.push((mesh.origin(h), mesh.dest(h)));
+        }
+    }
+
+    if crossed.is_empty() { return None; }
+
+    // Verify consecutive edges share a vertex
+    for w in crossed.windows(2) {
+        if shared_vertex(w[0], w[1]).is_none() {
+            return None;
+        }
+    }
+
+    Some(crossed)
+}
+
 /// Find the vertex shared between two edges, if any.
 fn shared_vertex(e1: (usize, usize), e2: (usize, usize)) -> Option<usize> {
     if e1.0 == e2.0 || e1.0 == e2.1 { Some(e1.0) }
@@ -699,12 +754,54 @@ pub fn shorten_path(
     path: &GeodesicPath,
     config: &FlipConfig,
 ) -> GeodesicPath {
-    let mut pts = path.points.clone();
     let is_closed = path.is_closed;
 
-    if pts.len() < 3 {
+    if path.points.len() < 3 {
         return path.clone();
     }
+
+    // Pre-optimization: if the path is a pure vertex path (from Dijkstra),
+    // try strip unfolding via fan expansion BEFORE per-vertex shortening.
+    // This handles cases where the Dijkstra path follows mesh boundaries
+    // and per-vertex shortening can't improve (locally straight vertices).
+    let pre_opt = if !is_closed {
+        let verts: Vec<usize> = path.points.iter().filter_map(|p| p.as_vertex()).collect();
+        if verts.len() == path.points.len() && verts.len() >= 3 {
+            if let Some(crossed) = vertex_path_to_crossed_edges(mesh, &verts) {
+                let start_v = verts[0];
+                let end_v = *verts.last().unwrap();
+                let proxy = GeodesicPath {
+                    points: {
+                        let mut pp = vec![PathPoint::Vertex(start_v)];
+                        for &(v0, v1) in &crossed {
+                            pp.push(PathPoint::Edge { v0, v1, t: 0.5 });
+                        }
+                        pp.push(PathPoint::Vertex(end_v));
+                        pp
+                    },
+                    is_closed: false,
+                };
+                let opt = optimize_strip(mesh, &proxy);
+                if opt.euclidean_length(mesh) < path.euclidean_length(mesh) - 1e-14 {
+                    Some(opt)
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    let mut pts = if let Some(opt) = pre_opt {
+        opt.points
+    } else {
+        path.points.clone()
+    };
 
     let mut prev_len = f64::INFINITY;
 
