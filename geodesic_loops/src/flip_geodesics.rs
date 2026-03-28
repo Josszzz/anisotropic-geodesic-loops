@@ -124,10 +124,10 @@ impl GeodesicPath {
 
     /// Metric length of the path.
     ///
-    /// For each segment, the metric length is approximated as:
-    ///   Euclidean_segment_length × (metric_edge_len / euclidean_edge_len)
-    /// averaged over the mesh edges that the segment's endpoints lie on.
-    /// For the Euclidean metric this reduces to the Euclidean length exactly.
+    /// For each segment, the metric length is computed by subdividing into
+    /// small steps and integrating the local metric ratio (metric/euclidean).
+    /// This correctly handles long segments that cross regions with varying
+    /// speed (e.g. a segment crossing a slow zone).
     pub fn metric_length(&self, mesh: &HalfedgeMesh) -> f64 {
         // For pure-vertex paths, use the exact mesh edge weights.
         if self.points.iter().all(|p| p.as_vertex().is_some()) {
@@ -142,7 +142,10 @@ impl GeodesicPath {
             };
             return base + close;
         }
-        // For paths with edge crossings, sum metric-weighted segment lengths.
+        // For paths with edge crossings, integrate the metric along each segment.
+        if mesh.is_euclidean() {
+            return self.euclidean_length(mesh);
+        }
         let positions: Vec<[f64; 3]> = self.points.iter()
             .map(|p| p.position(mesh)).collect();
         let n = positions.len();
@@ -151,13 +154,7 @@ impl GeodesicPath {
         let mut total = 0.0;
         for s in 0..seg_count {
             let j = (s + 1) % n;
-            let euc_d = dist3(&positions[s], &positions[j]);
-            if euc_d < 1e-30 { continue; }
-            // Compute the metric/euclidean ratio at each endpoint
-            let r0 = metric_ratio_at(&self.points[s], mesh);
-            let r1 = metric_ratio_at(&self.points[j], mesh);
-            // Average ratio (trapezoidal approximation)
-            total += euc_d * 0.5 * (r0 + r1);
+            total += integrate_metric_segment(mesh, &positions[s], &positions[j]);
         }
         total
     }
@@ -166,6 +163,84 @@ impl GeodesicPath {
 // ────────────────────────────────────────────────────────────────
 // Internal mesh helpers
 // ────────────────────────────────────────────────────────────────
+
+/// Integrate the metric length along a straight-line 3-D segment from `p` to `q`.
+/// Subdivides the segment and queries the nearest vertex speed at each sample,
+/// using a walking search for efficiency.
+fn integrate_metric_segment(mesh: &HalfedgeMesh, p: &[f64; 3], q: &[f64; 3]) -> f64 {
+    let euc = dist3(p, q);
+    if euc < 1e-30 { return 0.0; }
+
+    // Number of subdivisions: scale with segment length vs average edge.
+    let avg_edge = if mesh.n_edges() > 0 {
+        mesh.edge_lengths.iter().sum::<f64>() / mesh.n_edges() as f64
+    } else {
+        euc
+    };
+    let n_steps = ((euc / avg_edge).ceil() as usize).max(1).min(500);
+    let dt = 1.0 / n_steps as f64;
+    let step_len = euc * dt;
+
+    // Start walking search from the nearest vertex to `p`
+    let mut current_v = nearest_vertex_brute(mesh, p);
+
+    let mut total = 0.0;
+    for i in 0..n_steps {
+        let t = (i as f64 + 0.5) * dt;
+        let mid = [
+            p[0] + t * (q[0] - p[0]),
+            p[1] + t * (q[1] - p[1]),
+            p[2] + t * (q[2] - p[2]),
+        ];
+        current_v = walk_to_nearest(mesh, &mid, current_v);
+        let ratio = vertex_metric_ratio(mesh, current_v);
+        total += step_len * ratio;
+    }
+    total
+}
+
+/// Brute-force nearest vertex (used once per segment to seed the walk).
+fn nearest_vertex_brute(mesh: &HalfedgeMesh, pos: &[f64; 3]) -> usize {
+    let mut best_d2 = f64::INFINITY;
+    let mut best_v = 0usize;
+    for v in 0..mesh.n_verts() {
+        let vp = mesh.position(v);
+        let d2 = (pos[0]-vp[0]).powi(2) + (pos[1]-vp[1]).powi(2) + (pos[2]-vp[2]).powi(2);
+        if d2 < best_d2 { best_d2 = d2; best_v = v; }
+    }
+    best_v
+}
+
+/// Walk from `start` vertex to the nearest vertex to `pos` by greedy descent.
+fn walk_to_nearest(mesh: &HalfedgeMesh, pos: &[f64; 3], start: usize) -> usize {
+    let mut cur = start;
+    for _ in 0..50 {
+        let cp = mesh.position(cur);
+        let d_cur = (pos[0]-cp[0]).powi(2) + (pos[1]-cp[1]).powi(2) + (pos[2]-cp[2]).powi(2);
+        let mut best = cur;
+        let mut best_d = d_cur;
+        for h in mesh.outgoing_halfedges(cur) {
+            let v = mesh.dest(h);
+            let vp = mesh.position(v);
+            let d = (pos[0]-vp[0]).powi(2) + (pos[1]-vp[1]).powi(2) + (pos[2]-vp[2]).powi(2);
+            if d < best_d { best_d = d; best = v; }
+        }
+        if best == cur { return cur; }
+        cur = best;
+    }
+    cur
+}
+
+/// Metric/euclidean ratio at a vertex (from its incident edges).
+fn vertex_metric_ratio(mesh: &HalfedgeMesh, v: usize) -> f64 {
+    let mut sum_m = 0.0;
+    let mut sum_e = 0.0;
+    for h in mesh.outgoing_halfedges(v) {
+        sum_e += mesh.edge_len(h);
+        sum_m += mesh.metric_edge_len(h);
+    }
+    if sum_e > 1e-30 { sum_m / sum_e } else { 1.0 }
+}
 
 fn metric_edge_len_between(mesh: &HalfedgeMesh, u: usize, v: usize) -> f64 {
     for h in mesh.outgoing_halfedges(u) {
@@ -941,18 +1016,22 @@ pub fn shorten_path(
     path: &GeodesicPath,
     config: &FlipConfig,
 ) -> GeodesicPath {
-    // For Euclidean metric: flip to intrinsic Delaunay and shorten on the
-    // flipped copy. Intrinsic flipping is exact for Euclidean geometry.
-    // For non-Euclidean metrics: skip flipping (the metric-weighted strip
-    // unfolding and metric_length approximation cause accuracy issues).
-    if mesh.is_euclidean() {
-        let mut dm = mesh.clone();
-        let n_flips = dm.flip_to_delaunay(dm.n_edges() * 4);
-        if n_flips > 0 {
-            let result_on_dm = shorten_path_inner(&dm, path, config);
-            let translated = translate_path_to_original(mesh, &dm, &result_on_dm);
-            return translated;
-        }
+    // Create an intrinsic copy, convert edge lengths to metric, flip to
+    // Delaunay, then shorten on the flipped copy. The result is translated
+    // back to the original mesh's edge parameterization.
+    let mut dm = mesh.clone();
+    if !mesh.is_euclidean() {
+        dm.init_metric_edge_lengths();
+    }
+    let n_flips = dm.flip_to_delaunay(dm.n_edges() * 4);
+    if n_flips > 0 {
+        let result_on_dm = shorten_path_inner(&dm, path, config);
+        let translated = translate_path_to_original(mesh, &dm, &result_on_dm);
+        // Compare with the non-flipped result (both on original mesh)
+        let result_no_flip = shorten_path_inner(mesh, path, config);
+        let len_flip = translated.metric_length(mesh);
+        let len_noflip = result_no_flip.metric_length(mesh);
+        return if len_flip < len_noflip { translated } else { result_no_flip };
     }
     shorten_path_inner(mesh, path, config)
 }
