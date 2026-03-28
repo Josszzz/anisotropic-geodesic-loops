@@ -345,6 +345,165 @@ impl HalfedgeMesh {
         let p2 = self.positions[self.he_origin[self.he_next[h1]]];
         cross3(&sub3(&p1, &p0), &sub3(&p2, &p0))
     }
+
+    // ────────────────────────────────────────────────────────────────
+    // Intrinsic edge flipping
+    // ────────────────────────────────────────────────────────────────
+
+    /// Check the intrinsic Delaunay criterion for the edge containing halfedge h.
+    /// Uses **metric** corner angles so that flipping respects the active metric
+    /// (isotropic speed map / fiber tensor). An edge is Delaunay iff the sum
+    /// of the opposite metric-weighted angles ≤ π.
+    pub fn is_intrinsic_delaunay(&self, h: usize) -> bool {
+        if self.is_boundary_edge(h) { return true; }
+        let t = self.he_twin[h];
+        // Opposite vertex in each face = origin of next(next(h))
+        let alpha = self.metric_corner_angle(self.he_next[self.he_next[h]]);
+        let beta  = self.metric_corner_angle(self.he_next[self.he_next[t]]);
+        alpha + beta <= std::f64::consts::PI + 1e-10
+    }
+
+    /// Flip the interior edge containing halfedge `h`.
+    ///
+    /// Before:
+    /// ```text
+    ///        c                    c
+    ///       / \                  /|\
+    ///      /   \                / | \
+    ///     / f0  \     =>      /  |  \
+    ///    a───h──→b           a  f0 f1 b
+    ///     \ f1  /             \  |  /
+    ///      \   /               \ | /
+    ///       \ /                  \|/
+    ///        d                    d
+    /// ```
+    ///
+    /// After: the edge becomes c→d.
+    /// Edge length is recomputed from the 2-D unfolded quadrilateral.
+    ///
+    /// Returns `false` if the edge cannot be flipped (boundary, or would
+    /// create a degenerate triangle).
+    pub fn flip_edge(&mut self, h: usize) -> bool {
+        if self.is_boundary_edge(h) { return false; }
+
+        let t = self.he_twin[h];     // twin of h
+        let f0 = self.he_face[h];    // left face
+        let f1 = self.he_face[t];    // right face
+
+        // Halfedges around the two faces (CCW):
+        //   face f0: h → hn → hp   (h: a→b, hn: b→c, hp: c→a)
+        //   face f1: t → tn → tp   (t: b→a, tn: a→d, tp: d→b)
+        let hn = self.he_next[h];
+        let hp = self.he_prev[h];
+        let tn = self.he_next[t];
+        let tp = self.he_prev[t];
+
+        let a = self.he_origin[h];   // origin of h
+        let b = self.he_origin[t];   // origin of t (= dest of h)
+        let c = self.he_origin[hp];  // apex of f0 (= dest of hn)
+        let d = self.he_origin[tp];  // apex of f1 (= dest of tn)
+
+        // Prevent flipping if it would create a duplicate edge
+        // (c and d are already connected)
+        for oh in self.outgoing_halfedges(c) {
+            if self.dest(oh) == d { return false; }
+        }
+
+        // Compute new intrinsic edge length |c−d| by unfolding the quad into 2-D.
+        // Uses Euclidean edge lengths for geometric consistency; the metric
+        // Delaunay criterion in is_intrinsic_delaunay() drives WHICH edges to flip.
+        let lab = self.edge_len(h);
+        let lac = self.edge_len(hp);
+        let lbc = self.edge_len(hn);
+        let lad = self.edge_len(tn);
+        let lbd = self.edge_len(tp);
+
+        // Place triangle (a, b, c):
+        //   a = (0, 0),  b = (lab, 0)
+        //   c from law of cosines at a
+        let cos_a_abc = (lab * lab + lac * lac - lbc * lbc) / (2.0 * lab * lac);
+        let sin_a_abc = (1.0 - cos_a_abc * cos_a_abc).max(0.0).sqrt();
+        let cx = lac * cos_a_abc;
+        let cy = lac * sin_a_abc;
+
+        // Place triangle (a, b, d):
+        //   d from law of cosines at a, below x-axis
+        let cos_a_abd = (lab * lab + lad * lad - lbd * lbd) / (2.0 * lab * lad);
+        let sin_a_abd = (1.0 - cos_a_abd * cos_a_abd).max(0.0).sqrt();
+        let dx = lad * cos_a_abd;
+        let dy = -(lad * sin_a_abd); // below x-axis
+
+        // New edge length: |c - d|
+        let new_len = ((cx - dx) * (cx - dx) + (cy - dy) * (cy - dy)).sqrt();
+        if new_len < 1e-15 { return false; } // degenerate
+
+        // --- Update halfedge connectivity ---
+        // After flip: h becomes c→d, t becomes d→c
+        //   face f0: h(c→d) → tp(d→b) → hn(b→c)
+        //   face f1: t(d→c) → hp(c→a) → tn(a→d)
+
+        self.he_origin[h] = c;
+        self.he_origin[t] = d;
+
+        // face f0: h, tp, hn
+        self.he_next[h]  = tp;
+        self.he_next[tp] = hn;
+        self.he_next[hn] = h;
+        self.he_prev[h]  = hn;
+        self.he_prev[tp] = h;
+        self.he_prev[hn] = tp;
+        self.he_face[tp] = f0;
+
+        // face f1: t, hp, tn
+        self.he_next[t]  = hp;
+        self.he_next[hp] = tn;
+        self.he_next[tn] = t;
+        self.he_prev[t]  = tn;
+        self.he_prev[hp] = t;
+        self.he_prev[tn] = hp;
+        self.he_face[hp] = f1;
+
+        // face_he: make sure each face points to a valid halfedge
+        self.face_he[f0] = h;
+        self.face_he[f1] = t;
+
+        // vert_he: vertices a and b might have lost their outgoing halfedge
+        // (h was from a, t was from b, but now h is from c and t is from d)
+        if self.vert_he[a] == h { self.vert_he[a] = tn; }
+        if self.vert_he[b] == t { self.vert_he[b] = tp; }
+        // c and d gain new outgoing halfedges
+        self.vert_he[c] = h;
+        self.vert_he[d] = t;
+
+        // Update edge length (intrinsic)
+        let eid = self.he_edge[h];
+        self.edge_lengths[eid] = new_len;
+
+        true
+    }
+
+    /// Flip all non-Delaunay edges until the triangulation is intrinsically
+    /// Delaunay (or `max_flips` is reached). Returns the number of flips performed.
+    pub fn flip_to_delaunay(&mut self, max_flips: usize) -> usize {
+        let mut total = 0;
+        for _ in 0..max_flips {
+            let mut flipped_any = false;
+            // Iterate over edges (each edge = pair of halfedges)
+            let n_he = self.he_next.len();
+            for h in 0..n_he {
+                if self.he_face[h] == INVALID { continue; } // skip boundary
+                let t = self.he_twin[h];
+                if h > t { continue; } // process each edge once
+                if self.is_intrinsic_delaunay(h) { continue; }
+                if self.flip_edge(h) {
+                    flipped_any = true;
+                    total += 1;
+                }
+            }
+            if !flipped_any { break; }
+        }
+        total
+    }
 }
 
 // ---- small vector helpers ----

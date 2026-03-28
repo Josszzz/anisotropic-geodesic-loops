@@ -931,7 +931,120 @@ impl Default for FlipConfig {
 
 /// Shorten a geodesic path by iteratively replacing interior Vertex points
 /// with edge-crossing PathPoints via fan unfolding.
+///
+/// When the mesh is not intrinsically Delaunay, non-Delaunay edges can trap
+/// the shortening in local optima. We first flip edges on a **copy** of the
+/// mesh to make it Delaunay, run the shortening on the Delaunay copy, then
+/// translate the result back to the original mesh's edge parameterization.
 pub fn shorten_path(
+    mesh: &HalfedgeMesh,
+    path: &GeodesicPath,
+    config: &FlipConfig,
+) -> GeodesicPath {
+    // Make an intrinsically Delaunay copy and shorten on it.
+    let mut dm = mesh.clone();
+    let n_flips = dm.flip_to_delaunay(mesh.n_edges() * 4);
+    if n_flips > 0 {
+        let result_on_dm = shorten_path_inner(&dm, path, config);
+        // Translate edge crossings back: the flipped mesh shares vertex indices
+        // with the original but some edges are different. For each Edge crossing
+        // on a flipped edge (c,d) that doesn't exist in the original mesh, find
+        // its 3-D position and locate the corresponding edge in the original mesh.
+        let translated = translate_path_to_original(mesh, &dm, &result_on_dm);
+        return translated;
+    }
+    shorten_path_inner(mesh, path, config)
+}
+
+/// Translate a path from a Delaunay-flipped mesh back to the original mesh.
+/// Edge crossings on flipped edges are converted to crossings on the
+/// original mesh edges by finding the 3-D position and locating the
+/// enclosing original triangle.
+fn translate_path_to_original(
+    orig: &HalfedgeMesh,
+    flipped: &HalfedgeMesh,
+    path: &GeodesicPath,
+) -> GeodesicPath {
+    let mut new_points = Vec::with_capacity(path.points.len());
+    for pt in &path.points {
+        match pt {
+            PathPoint::Vertex(v) => {
+                new_points.push(PathPoint::Vertex(*v));
+            }
+            PathPoint::Edge { v0, v1, t } => {
+                // Check if this edge exists in the original mesh
+                let h = find_halfedge(orig, *v0, *v1);
+                if h != INVALID {
+                    // Edge exists in original — keep as-is
+                    new_points.push(pt.clone());
+                } else {
+                    // Edge was created by flipping — find 3-D position and
+                    // locate the enclosing edge in the original mesh.
+                    let pos = pt.position(flipped);
+                    if let Some(new_pt) = locate_point_on_original(orig, &pos, *v0, *v1) {
+                        new_points.push(new_pt);
+                    } else {
+                        // Fallback: use nearest vertex
+                        let dv0 = crate::mesh::dist3(&pos, &orig.position(*v0));
+                        let dv1 = crate::mesh::dist3(&pos, &orig.position(*v1));
+                        new_points.push(PathPoint::Vertex(if dv0 <= dv1 { *v0 } else { *v1 }));
+                    }
+                }
+            }
+        }
+    }
+    GeodesicPath { points: new_points, is_closed: path.is_closed }
+}
+
+/// Find which edge/face of the original mesh contains a 3-D point that lies
+/// on a flipped edge (v0, v1). The flipped edge (v0,v1) replaced the
+/// original edge between the two triangles sharing v0 and v1's quad.
+fn locate_point_on_original(
+    orig: &HalfedgeMesh,
+    pos: &[f64; 3],
+    v0: usize,
+    v1: usize,
+) -> Option<PathPoint> {
+    // The flipped edge (v0, v1) was the diagonal of a quad. In the original
+    // mesh, this quad had the OTHER diagonal. Find it: look for a vertex
+    // adjacent to both v0 and v1 in the original mesh.
+    // These shared neighbors are the other two vertices of the original quad.
+    let mut shared = Vec::new();
+    for h in orig.outgoing_halfedges(v0) {
+        let w = orig.dest(h);
+        if w == v1 { continue; }
+        for h2 in orig.outgoing_halfedges(v1) {
+            if orig.dest(h2) == w {
+                shared.push(w);
+                break;
+            }
+        }
+    }
+
+    // The original edge was between two shared neighbors.
+    // The flipped edge (v0,v1) crosses the original edge (shared[0], shared[1]).
+    if shared.len() >= 2 {
+        let a = shared[0];
+        let b = shared[1];
+        let h = find_halfedge(orig, a, b);
+        if h != INVALID {
+            // Project pos onto edge a→b
+            let pa = orig.position(a);
+            let pb = orig.position(b);
+            let ab = crate::mesh::sub3(&pb, &pa);
+            let ap = crate::mesh::sub3(pos, &pa);
+            let len_sq = crate::mesh::dot3(&ab, &ab);
+            if len_sq > 1e-30 {
+                let t = (crate::mesh::dot3(&ap, &ab) / len_sq).clamp(0.0, 1.0);
+                return Some(PathPoint::Edge { v0: a, v1: b, t });
+            }
+        }
+    }
+    None
+}
+
+/// Inner shortening logic (operates on a single mesh without flipping).
+fn shorten_path_inner(
     mesh: &HalfedgeMesh,
     path: &GeodesicPath,
     config: &FlipConfig,
@@ -1202,7 +1315,8 @@ pub fn classify_turn(
 pub fn is_delaunay_edge(mesh: &HalfedgeMesh, h: usize) -> bool {
     if mesh.is_boundary_edge(h) { return true; }
     let t = mesh.twin(h);
-    let alpha = mesh.corner_angle(mesh.next(h));
-    let beta  = mesh.corner_angle(mesh.next(t));
+    // Angles at the OPPOSITE vertices (not the edge endpoints)
+    let alpha = mesh.corner_angle(mesh.next(mesh.next(h)));
+    let beta  = mesh.corner_angle(mesh.next(mesh.next(t)));
     alpha + beta <= std::f64::consts::PI + 1e-10
 }
