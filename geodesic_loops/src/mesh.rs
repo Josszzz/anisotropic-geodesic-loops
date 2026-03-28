@@ -351,16 +351,35 @@ impl HalfedgeMesh {
     // ────────────────────────────────────────────────────────────────
 
     /// Check the intrinsic Delaunay criterion for the edge containing halfedge h.
-    /// Uses **metric** corner angles so that flipping respects the active metric
-    /// (isotropic speed map / fiber tensor). An edge is Delaunay iff the sum
-    /// of the opposite metric-weighted angles ≤ π.
+    /// Uses `corner_angle` (which reads `edge_lengths`). When working on an
+    /// intrinsic copy where `edge_lengths` have been set to metric lengths
+    /// via `init_metric_edge_lengths()`, this automatically respects the metric.
     pub fn is_intrinsic_delaunay(&self, h: usize) -> bool {
         if self.is_boundary_edge(h) { return true; }
         let t = self.he_twin[h];
-        // Opposite vertex in each face = origin of next(next(h))
-        let alpha = self.metric_corner_angle(self.he_next[self.he_next[h]]);
-        let beta  = self.metric_corner_angle(self.he_next[self.he_next[t]]);
+        let alpha = self.corner_angle(self.he_next[self.he_next[h]]);
+        let beta  = self.corner_angle(self.he_next[self.he_next[t]]);
         alpha + beta <= std::f64::consts::PI + 1e-10
+    }
+
+    /// Replace each entry in `edge_lengths` with the metric-weighted edge
+    /// length, then set the metric to Euclidean so that `edge_len()` and
+    /// `metric_edge_len()` both return the metric length directly.
+    /// This prepares the mesh for intrinsic edge flipping: all subsequent
+    /// operations (Delaunay checks, fan unfolding, Dijkstra) use the metric
+    /// geometry stored as "intrinsic edge lengths".
+    pub fn init_metric_edge_lengths(&mut self) {
+        let n_he = self.he_next.len();
+        // For each edge, find any halfedge and compute metric_edge_len
+        let mut visited = vec![false; self.edge_lengths.len()];
+        for h in 0..n_he {
+            let eid = self.he_edge[h];
+            if eid >= self.edge_lengths.len() || visited[eid] { continue; }
+            visited[eid] = true;
+            self.edge_lengths[eid] = self.metric_edge_len(h);
+        }
+        // Set metric to Euclidean so metric_edge_len == edge_len
+        self.metric = Metric::Euclidean;
     }
 
     /// Flip the interior edge containing halfedge `h`.

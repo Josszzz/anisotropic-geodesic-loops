@@ -941,17 +941,18 @@ pub fn shorten_path(
     path: &GeodesicPath,
     config: &FlipConfig,
 ) -> GeodesicPath {
-    // Make an intrinsically Delaunay copy and shorten on it.
-    let mut dm = mesh.clone();
-    let n_flips = dm.flip_to_delaunay(mesh.n_edges() * 4);
-    if n_flips > 0 {
-        let result_on_dm = shorten_path_inner(&dm, path, config);
-        // Translate edge crossings back: the flipped mesh shares vertex indices
-        // with the original but some edges are different. For each Edge crossing
-        // on a flipped edge (c,d) that doesn't exist in the original mesh, find
-        // its 3-D position and locate the corresponding edge in the original mesh.
-        let translated = translate_path_to_original(mesh, &dm, &result_on_dm);
-        return translated;
+    // For Euclidean metric: flip to intrinsic Delaunay and shorten on the
+    // flipped copy. Intrinsic flipping is exact for Euclidean geometry.
+    // For non-Euclidean metrics: skip flipping (the metric-weighted strip
+    // unfolding and metric_length approximation cause accuracy issues).
+    if mesh.is_euclidean() {
+        let mut dm = mesh.clone();
+        let n_flips = dm.flip_to_delaunay(dm.n_edges() * 4);
+        if n_flips > 0 {
+            let result_on_dm = shorten_path_inner(&dm, path, config);
+            let translated = translate_path_to_original(mesh, &dm, &result_on_dm);
+            return translated;
+        }
     }
     shorten_path_inner(mesh, path, config)
 }
