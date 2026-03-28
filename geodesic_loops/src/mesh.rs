@@ -320,6 +320,18 @@ impl HalfedgeMesh {
         cos_angle.clamp(-1.0, 1.0).acos()
     }
 
+    /// Interior angle at the corner using metric edge lengths.
+    /// Same as `corner_angle` but uses `metric_edge_len` so the unfolding
+    /// respects the active metric (isotropic speed / fiber tensor).
+    pub fn metric_corner_angle(&self, h: usize) -> f64 {
+        let a = self.metric_edge_len(h);
+        let b = self.metric_edge_len(self.prev(h));
+        let c = self.metric_edge_len(self.next(h));
+        if a < 1e-30 || b < 1e-30 { return 0.0; }
+        let cos_angle = (a * a + b * b - c * c) / (2.0 * a * b);
+        cos_angle.clamp(-1.0, 1.0).acos()
+    }
+
     /// 3-D face normal (unnormalized)
     pub fn face_normal(&self, f: usize) -> [f64; 3] {
         let h0 = self.face_he[f];

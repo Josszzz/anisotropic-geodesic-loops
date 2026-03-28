@@ -122,10 +122,14 @@ impl GeodesicPath {
         total
     }
 
-    /// Metric length.  For pure-vertex paths the mesh edge weights are used;
-    /// for paths with edge crossings the Euclidean length is returned
-    /// (exact for the Euclidean metric, approximate otherwise).
+    /// Metric length of the path.
+    ///
+    /// For each segment, the metric length is approximated as:
+    ///   Euclidean_segment_length × (metric_edge_len / euclidean_edge_len)
+    /// averaged over the mesh edges that the segment's endpoints lie on.
+    /// For the Euclidean metric this reduces to the Euclidean length exactly.
     pub fn metric_length(&self, mesh: &HalfedgeMesh) -> f64 {
+        // For pure-vertex paths, use the exact mesh edge weights.
         if self.points.iter().all(|p| p.as_vertex().is_some()) {
             let verts = self.vertex_indices();
             let base = crate::geodesic::path_metric_length(mesh, &verts);
@@ -136,10 +140,26 @@ impl GeodesicPath {
             } else {
                 0.0
             };
-            base + close
-        } else {
-            self.euclidean_length(mesh)
+            return base + close;
         }
+        // For paths with edge crossings, sum metric-weighted segment lengths.
+        let positions: Vec<[f64; 3]> = self.points.iter()
+            .map(|p| p.position(mesh)).collect();
+        let n = positions.len();
+        if n < 2 { return 0.0; }
+        let seg_count = if self.is_closed { n } else { n - 1 };
+        let mut total = 0.0;
+        for s in 0..seg_count {
+            let j = (s + 1) % n;
+            let euc_d = dist3(&positions[s], &positions[j]);
+            if euc_d < 1e-30 { continue; }
+            // Compute the metric/euclidean ratio at each endpoint
+            let r0 = metric_ratio_at(&self.points[s], mesh);
+            let r1 = metric_ratio_at(&self.points[j], mesh);
+            // Average ratio (trapezoidal approximation)
+            total += euc_d * 0.5 * (r0 + r1);
+        }
+        total
     }
 }
 
@@ -152,6 +172,34 @@ fn metric_edge_len_between(mesh: &HalfedgeMesh, u: usize, v: usize) -> f64 {
         if mesh.dest(h) == v { return mesh.metric_edge_len(h); }
     }
     f64::INFINITY
+}
+
+/// Compute the metric/euclidean ratio at a path point.
+/// For Vertex(v), uses the average ratio of incident edges.
+/// For Edge{v0,v1,t}, interpolates the ratio of that edge.
+fn metric_ratio_at(pt: &PathPoint, mesh: &HalfedgeMesh) -> f64 {
+    match pt {
+        PathPoint::Vertex(v) => {
+            let mut sum_m = 0.0;
+            let mut sum_e = 0.0;
+            for h in mesh.outgoing_halfedges(*v) {
+                let e = mesh.edge_len(h);
+                let m = mesh.metric_edge_len(h);
+                sum_e += e;
+                sum_m += m;
+            }
+            if sum_e > 1e-30 { sum_m / sum_e } else { 1.0 }
+        }
+        PathPoint::Edge { v0, v1, .. } => {
+            for h in mesh.outgoing_halfedges(*v0) {
+                if mesh.dest(h) == *v1 {
+                    let e = mesh.edge_len(h);
+                    return if e > 1e-30 { mesh.metric_edge_len(h) / e } else { 1.0 };
+                }
+            }
+            1.0
+        }
+    }
 }
 
 /// Find the halfedge u → v, or INVALID.
@@ -206,14 +254,14 @@ fn unfold_fan_ccw(
     if mesh.is_boundary_he(h_out) { return None; }
 
     let mut fan_he: Vec<usize> = vec![h_out];
-    let mut verts_2d: Vec<[f64; 2]> = vec![[mesh.edge_len(h_out), 0.0]];
+    let mut verts_2d: Vec<[f64; 2]> = vec![[mesh.metric_edge_len(h_out), 0.0]];
     let mut cum = 0.0f64;
     let mut h = h_out;
 
     for _ in 0..512 {
         if mesh.is_boundary_he(h) { return None; }
 
-        cum += mesh.corner_angle(h);
+        cum += mesh.metric_corner_angle(h);
 
         // CCW step around B: twin(prev(h))
         let ph = mesh.prev(h);
@@ -221,7 +269,7 @@ fn unfold_fan_ccw(
         let hn = mesh.twin(ph);
         if hn == INVALID { return None; }
 
-        let r = mesh.edge_len(hn);
+        let r = mesh.metric_edge_len(hn);
         verts_2d.push([r * cum.cos(), r * cum.sin()]);
         fan_he.push(hn);
 
@@ -249,7 +297,7 @@ fn unfold_fan_cw(
     if mesh.origin(h_out) != b { return None; }
 
     let mut fan_he: Vec<usize> = vec![h_out];
-    let mut verts_2d: Vec<[f64; 2]> = vec![[mesh.edge_len(h_out), 0.0]];
+    let mut verts_2d: Vec<[f64; 2]> = vec![[mesh.metric_edge_len(h_out), 0.0]];
     let mut cum = 0.0f64;
     let mut h = h_out;
 
@@ -262,9 +310,9 @@ fn unfold_fan_cw(
         if hn == INVALID { return None; }
         if mesh.origin(hn) != b { return None; }
 
-        cum -= mesh.corner_angle(hn);
+        cum -= mesh.metric_corner_angle(hn);
 
-        let r = mesh.edge_len(hn);
+        let r = mesh.metric_edge_len(hn);
         verts_2d.push([r * cum.cos(), r * cum.sin()]);
         fan_he.push(hn);
 
@@ -633,9 +681,12 @@ fn optimize_strip(mesh: &HalfedgeMesh, path: &GeodesicPath) -> GeodesicPath {
 
     // Place first triangle: {start_v, crossed[0].0, crossed[0].1}
     let (e0a, e0b) = crossed[0];
-    let d_s_a = dist3(&mesh.position(start_v), &mesh.position(e0a));
-    let d_s_b = dist3(&mesh.position(start_v), &mesh.position(e0b));
-    let d_a_b = dist3(&mesh.position(e0a), &mesh.position(e0b));
+    let d_s_a = metric_edge_len_between(mesh, start_v, e0a);
+    let d_s_b = metric_edge_len_between(mesh, start_v, e0b);
+    let d_a_b = metric_edge_len_between(mesh, e0a, e0b);
+    if d_s_a.is_infinite() || d_s_b.is_infinite() || d_a_b.is_infinite() {
+        return path.clone();
+    }
 
     pos_2d.insert(start_v, [0.0, 0.0]);
     pos_2d.insert(e0a, [d_s_a, 0.0]);
@@ -672,8 +723,9 @@ fn optimize_strip(mesh: &HalfedgeMesh, path: &GeodesicPath) -> GeodesicPath {
         let ev1_2d = match pos_2d.get(&ev1) { Some(p) => *p, None => return path.clone() };
         let prev_2d = match pos_2d.get(&prev_v) { Some(p) => *p, None => return path.clone() };
 
-        let d0 = dist3(&mesh.position(ev0), &mesh.position(new_v));
-        let d1 = dist3(&mesh.position(ev1), &mesh.position(new_v));
+        let d0 = metric_edge_len_between(mesh, ev0, new_v);
+        let d1 = metric_edge_len_between(mesh, ev1, new_v);
+        if d0.is_infinite() || d1.is_infinite() { return path.clone(); }
 
         let edge_dir = sub2(ev1_2d, ev0_2d);
         let to_prev = sub2(prev_2d, ev0_2d);
@@ -720,8 +772,8 @@ fn optimize_strip(mesh: &HalfedgeMesh, path: &GeodesicPath) -> GeodesicPath {
     let result = GeodesicPath { points: new_points, is_closed: false };
 
     // Only use the result if it's shorter
-    let old_len = path.euclidean_length(mesh);
-    let new_len = result.euclidean_length(mesh);
+    let old_len = path.metric_length(mesh);
+    let new_len = result.metric_length(mesh);
     if new_len < old_len - 1e-14 { result } else { path.clone() }
 }
 
@@ -782,7 +834,7 @@ pub fn shorten_path(
                     is_closed: false,
                 };
                 let opt = optimize_strip(mesh, &proxy);
-                if opt.euclidean_length(mesh) < path.euclidean_length(mesh) - 1e-14 {
+                if opt.metric_length(mesh) < path.metric_length(mesh) - 1e-14 {
                     Some(opt)
                 } else {
                     None
@@ -850,7 +902,7 @@ pub fn shorten_path(
         }
 
         let cur_len = GeodesicPath { points: pts.clone(), is_closed }
-            .euclidean_length(mesh);
+            .metric_length(mesh);
 
         if cur_len < 1e-15 { break; }
         let rel_dec = (prev_len - cur_len) / prev_len.max(cur_len);
