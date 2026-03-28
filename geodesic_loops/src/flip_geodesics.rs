@@ -165,13 +165,12 @@ impl GeodesicPath {
 // ────────────────────────────────────────────────────────────────
 
 /// Integrate the metric length along a straight-line 3-D segment from `p` to `q`.
-/// Subdivides the segment and queries the nearest vertex speed at each sample,
-/// using a walking search for efficiency.
+/// Subdivides the segment, locates each sample in a mesh triangle, and
+/// interpolates the per-vertex metric ratio barycentrically.
 fn integrate_metric_segment(mesh: &HalfedgeMesh, p: &[f64; 3], q: &[f64; 3]) -> f64 {
     let euc = dist3(p, q);
     if euc < 1e-30 { return 0.0; }
 
-    // Number of subdivisions: scale with segment length vs average edge.
     let avg_edge = if mesh.n_edges() > 0 {
         mesh.edge_lengths.iter().sum::<f64>() / mesh.n_edges() as f64
     } else {
@@ -181,25 +180,138 @@ fn integrate_metric_segment(mesh: &HalfedgeMesh, p: &[f64; 3], q: &[f64; 3]) -> 
     let dt = 1.0 / n_steps as f64;
     let step_len = euc * dt;
 
-    // Start walking search from the nearest vertex to `p`
-    let mut current_v = nearest_vertex_brute(mesh, p);
+    // Precompute per-vertex slowness (1/speed) for barycentric interpolation
+    let slowness = vertex_slowness_array(mesh);
+
+    // Seed face search from a vertex near the start
+    let start_v = nearest_vertex_brute(mesh, p);
+    let mut hint_face = mesh.vert_he[start_v];
+    if hint_face != INVALID { hint_face = mesh.he_face[hint_face]; }
 
     let mut total = 0.0;
     for i in 0..n_steps {
         let t = (i as f64 + 0.5) * dt;
-        let mid = [
+        let pt = [
             p[0] + t * (q[0] - p[0]),
             p[1] + t * (q[1] - p[1]),
             p[2] + t * (q[2] - p[2]),
         ];
-        current_v = walk_to_nearest(mesh, &mid, current_v);
-        let ratio = vertex_metric_ratio(mesh, current_v);
+        let (ratio, face) = barycentric_metric_ratio(mesh, &pt, &slowness, hint_face);
+        if face != INVALID { hint_face = face; }
         total += step_len * ratio;
     }
     total
 }
 
-/// Brute-force nearest vertex (used once per segment to seed the walk).
+/// Build per-vertex slowness array (metric/euclidean ratio ≈ 1/speed).
+fn vertex_slowness_array(mesh: &HalfedgeMesh) -> Vec<f64> {
+    match &mesh.metric {
+        crate::mesh::Metric::Euclidean => vec![1.0; mesh.n_verts()],
+        crate::mesh::Metric::IsotropicSpeed(speeds) => {
+            speeds.iter().map(|&s| if s > 1e-30 { 1.0 / s } else { 1e30 }).collect()
+        }
+        crate::mesh::Metric::FiberTensor { speeds_transverse, .. } => {
+            // For scalar ratio approximation, use transverse speed
+            speeds_transverse.iter().map(|&s| if s > 1e-30 { 1.0 / s } else { 1e30 }).collect()
+        }
+    }
+}
+
+/// Locate the face containing `pt` (walking from `hint`), compute the
+/// barycentric interpolation of the slowness field, and return (ratio, face).
+fn barycentric_metric_ratio(
+    mesh: &HalfedgeMesh,
+    pt: &[f64; 3],
+    slowness: &[f64],
+    hint: usize,
+) -> (f64, usize) {
+    let face = locate_face(mesh, pt, hint);
+    if face == INVALID {
+        // Fallback: nearest vertex
+        let v = nearest_vertex_brute(mesh, pt);
+        return (slowness[v], INVALID);
+    }
+    let h0 = mesh.face_he[face];
+    let h1 = mesh.he_next[h0];
+    let h2 = mesh.he_next[h1];
+    let va = mesh.he_origin[h0];
+    let vb = mesh.he_origin[h1];
+    let vc = mesh.he_origin[h2];
+    let pa = mesh.position(va);
+    let pb = mesh.position(vb);
+    let pc = mesh.position(vc);
+
+    let (u, v, w) = barycentric_coords(pt, &pa, &pb, &pc);
+    let ratio = u * slowness[va] + v * slowness[vb] + w * slowness[vc];
+    (ratio.max(0.0), face)
+}
+
+/// Barycentric coordinates of point `p` in triangle (a, b, c).
+/// Returns (u, v, w) with u+v+w ≈ 1, clamped to [0,1].
+fn barycentric_coords(
+    p: &[f64; 3], a: &[f64; 3], b: &[f64; 3], c: &[f64; 3],
+) -> (f64, f64, f64) {
+    let ab = sub3(b, a);
+    let ac = sub3(c, a);
+    let ap = sub3(p, a);
+    let d00 = dot3(&ab, &ab);
+    let d01 = dot3(&ab, &ac);
+    let d11 = dot3(&ac, &ac);
+    let d20 = dot3(&ap, &ab);
+    let d21 = dot3(&ap, &ac);
+    let denom = d00 * d11 - d01 * d01;
+    if denom.abs() < 1e-30 {
+        return (1.0 / 3.0, 1.0 / 3.0, 1.0 / 3.0);
+    }
+    let v = (d11 * d20 - d01 * d21) / denom;
+    let w = (d00 * d21 - d01 * d20) / denom;
+    let u = 1.0 - v - w;
+    (u.max(0.0), v.max(0.0), w.max(0.0))
+}
+
+/// Walk across faces to locate the face containing `pt`, starting from `hint`.
+fn locate_face(mesh: &HalfedgeMesh, pt: &[f64; 3], hint: usize) -> usize {
+    if hint >= mesh.n_faces() {
+        // No valid hint — find any face from nearest vertex
+        let v = nearest_vertex_brute(mesh, pt);
+        for h in mesh.outgoing_halfedges(v) {
+            let f = mesh.he_face[h];
+            if f != INVALID { return locate_face(mesh, pt, f); }
+        }
+        return INVALID;
+    }
+
+    let mut face = hint;
+    for _ in 0..mesh.n_faces().min(200) {
+        let h0 = mesh.face_he[face];
+        let h1 = mesh.he_next[h0];
+        let h2 = mesh.he_next[h1];
+
+        let pa = mesh.position(mesh.he_origin[h0]);
+        let pb = mesh.position(mesh.he_origin[h1]);
+        let pc = mesh.position(mesh.he_origin[h2]);
+
+        let (u, v, w) = barycentric_coords(pt, &pa, &pb, &pc);
+
+        // If inside (or close enough), return this face
+        let eps = -1e-6;
+        if u >= eps && v >= eps && w >= eps {
+            return face;
+        }
+
+        // Walk toward the point: cross the edge opposite the most negative coord
+        let cross_h = if u < v && u < w { h1 }      // opposite to a → cross b-c
+                      else if v < w     { h2 }      // opposite to b → cross c-a
+                      else              { h0 };      // opposite to c → cross a-b
+        let twin = mesh.he_twin[cross_h];
+        let next_face = mesh.he_face[twin];
+        if next_face == INVALID { return face; } // hit boundary, use current
+        face = next_face;
+    }
+    face
+}
+
+/// Brute-force nearest vertex (used to seed face walks).
 fn nearest_vertex_brute(mesh: &HalfedgeMesh, pos: &[f64; 3]) -> usize {
     let mut best_d2 = f64::INFINITY;
     let mut best_v = 0usize;
@@ -209,37 +321,6 @@ fn nearest_vertex_brute(mesh: &HalfedgeMesh, pos: &[f64; 3]) -> usize {
         if d2 < best_d2 { best_d2 = d2; best_v = v; }
     }
     best_v
-}
-
-/// Walk from `start` vertex to the nearest vertex to `pos` by greedy descent.
-fn walk_to_nearest(mesh: &HalfedgeMesh, pos: &[f64; 3], start: usize) -> usize {
-    let mut cur = start;
-    for _ in 0..50 {
-        let cp = mesh.position(cur);
-        let d_cur = (pos[0]-cp[0]).powi(2) + (pos[1]-cp[1]).powi(2) + (pos[2]-cp[2]).powi(2);
-        let mut best = cur;
-        let mut best_d = d_cur;
-        for h in mesh.outgoing_halfedges(cur) {
-            let v = mesh.dest(h);
-            let vp = mesh.position(v);
-            let d = (pos[0]-vp[0]).powi(2) + (pos[1]-vp[1]).powi(2) + (pos[2]-vp[2]).powi(2);
-            if d < best_d { best_d = d; best = v; }
-        }
-        if best == cur { return cur; }
-        cur = best;
-    }
-    cur
-}
-
-/// Metric/euclidean ratio at a vertex (from its incident edges).
-fn vertex_metric_ratio(mesh: &HalfedgeMesh, v: usize) -> f64 {
-    let mut sum_m = 0.0;
-    let mut sum_e = 0.0;
-    for h in mesh.outgoing_halfedges(v) {
-        sum_e += mesh.edge_len(h);
-        sum_m += mesh.metric_edge_len(h);
-    }
-    if sum_e > 1e-30 { sum_m / sum_e } else { 1.0 }
 }
 
 fn metric_edge_len_between(mesh: &HalfedgeMesh, u: usize, v: usize) -> f64 {
