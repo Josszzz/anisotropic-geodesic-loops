@@ -942,7 +942,35 @@ pub fn shorten_path(
         return path.clone();
     }
 
+    // Pre-optimization: for vertex paths, apply strip unfolding to convert
+    // boundary vertices to edge crossings.
+    // - Euclidean: full-path strip (exact, handles all boundary vertices)
+    // - Non-Euclidean: windowed strip (limits metric distortion)
     let mut pts = path.points.clone();
+    if !is_closed {
+        let verts: Vec<usize> = pts.iter().filter_map(|p| p.as_vertex()).collect();
+        if verts.len() == pts.len() && verts.len() >= 3 {
+            if mesh.is_euclidean() {
+                // Full-path strip unfolding (exact for Euclidean)
+                if let Some(crossed) = vertex_path_to_crossed_edges(mesh, &verts) {
+                    if !crossed.is_empty() {
+                        let start_v = verts[0];
+                        let end_v = *verts.last().unwrap();
+                        let mut pp = vec![PathPoint::Vertex(start_v)];
+                        for &(v0, v1) in &crossed {
+                            pp.push(PathPoint::Edge { v0, v1, t: 0.5 });
+                        }
+                        pp.push(PathPoint::Vertex(end_v));
+                        let proxy = GeodesicPath { points: pp, is_closed: false };
+                        let opt = optimize_strip(mesh, &proxy);
+                        if opt.metric_length(mesh) < path.metric_length(mesh) - 1e-14 {
+                            pts = opt.points;
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     let mut prev_len = f64::INFINITY;
 

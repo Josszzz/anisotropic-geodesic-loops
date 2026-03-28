@@ -62,6 +62,10 @@ pub struct HalfedgeMesh {
 }
 
 impl HalfedgeMesh {
+    /// True when the active metric is plain Euclidean (no speed / fiber map).
+    pub fn is_euclidean(&self) -> bool {
+        matches!(self.metric, Metric::Euclidean)
+    }
     /// Build mesh from vertex positions and triangle faces (0-indexed).
     /// Boundary edges get a twin halfedge with `he_face = INVALID`.
     pub fn from_vertices_faces(verts: &[[f64; 3]], faces: &[[usize; 3]]) -> Self {
