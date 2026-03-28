@@ -1294,43 +1294,140 @@ fn shorten_path_inner(
         result = optimize_strip(mesh, &result);
     }
 
-    // Post-process: windowed strip unfolding for remaining vertex runs.
-    // After per-vertex shortening, some vertices (especially on mesh boundaries)
-    // remain unshortened. Find contiguous runs of Vertex points and optimize them.
-    if !is_closed {
-        let pts = &result.points;
-        // Find runs of consecutive Vertex points of length >= 3
-        let mut new_pts: Vec<PathPoint> = Vec::new();
-        let mut run_start = None;
-        for i in 0..=pts.len() {
-            let is_vertex = i < pts.len() && pts[i].as_vertex().is_some();
-            if is_vertex {
+    // Post-process: for each contiguous run of ≥3 Vertex points, apply
+    // strip unfolding. Include the adjacent Edge-crossing points so the
+    // optimizer sees where the path comes from / goes to (otherwise collinear
+    // boundary runs can't be straightened).
+    if !is_closed && result.points.len() >= 3 {
+        let pts = result.points.clone();
+        let n = pts.len();
+
+        // Identify vertex runs (start_index, length)
+        let mut runs: Vec<(usize, usize)> = Vec::new();
+        let mut run_start: Option<usize> = None;
+        for i in 0..=n {
+            let is_v = i < n && pts[i].as_vertex().is_some();
+            if is_v {
                 if run_start.is_none() { run_start = Some(i); }
-            } else {
-                if let Some(start) = run_start {
-                    let run = &pts[start..i];
-                    let run_verts: Vec<usize> = run.iter()
-                        .filter_map(|p| p.as_vertex()).collect();
-                    if run_verts.len() >= 3 {
-                        let optimized = windowed_strip_optimize(mesh, &run_verts);
-                        // Skip first if it duplicates the last non-vertex point
-                        if start > 0 && !new_pts.is_empty() {
-                            new_pts.extend_from_slice(&optimized);
-                        } else {
-                            new_pts.extend(optimized);
-                        }
-                    } else {
-                        new_pts.extend_from_slice(run);
-                    }
-                    run_start = None;
-                }
-                if i < pts.len() {
-                    new_pts.push(pts[i].clone());
-                }
+            } else if let Some(s) = run_start {
+                if i - s >= 3 { runs.push((s, i - s)); }
+                run_start = None;
             }
         }
-        if new_pts.len() >= 2 {
-            result = GeodesicPath { points: new_pts, is_closed: false };
+
+        // Process runs in reverse order (so splice indices stay valid)
+        for &(run_start_idx, run_len) in runs.iter().rev() {
+            let run_end_idx = run_start_idx + run_len; // exclusive
+            let run_verts: Vec<usize> = pts[run_start_idx..run_end_idx]
+                .iter().filter_map(|p| p.as_vertex()).collect();
+            if run_verts.len() < 3 { continue; }
+
+            // Build extended vertex list: the run's vertices plus one
+            // adjacent vertex on each side extracted from neighboring
+            // edge crossings (their v0 gives the hub vertex).
+            let mut ext_verts = run_verts.clone();
+            // Prepend: scan backward to find a non-collinear hub vertex
+            {
+                let first_v = ext_verts[0];
+                let mut found = false;
+                for k in (run_start_idx.saturating_sub(6)..run_start_idx).rev() {
+                    match &pts[k] {
+                        PathPoint::Edge { v0, v1, .. } => {
+                            for &candidate in &[*v1, *v0] {
+                                if candidate != first_v {
+                                    let h = find_halfedge(mesh, candidate, first_v);
+                                    if h != INVALID {
+                                        ext_verts.insert(0, candidate);
+                                        found = true;
+                                        break;
+                                    }
+                                }
+                            }
+                            if found { break; }
+                        }
+                        PathPoint::Vertex(v) => {
+                            if *v != first_v {
+                                ext_verts.insert(0, *v);
+                                found = true;
+                            }
+                            break;
+                        }
+                    }
+                }
+            }
+            // Append: scan forward past any edge crossings to find a
+            // vertex that gives directional context (preferably non-collinear
+            // with the boundary run). Try v0, v1 of each edge crossing,
+            // then the next Vertex point.
+            {
+                let last_v = *ext_verts.last().unwrap();
+                let mut found = false;
+                for k in run_end_idx..n.min(run_end_idx + 6) {
+                    match &pts[k] {
+                        PathPoint::Edge { v0, v1, .. } => {
+                            // Prefer the vertex that's NOT on the boundary
+                            // (gives diagonal direction info)
+                            for &candidate in &[*v1, *v0] {
+                                if candidate != last_v {
+                                    let h = find_halfedge(mesh, last_v, candidate);
+                                    if h != INVALID {
+                                        ext_verts.push(candidate);
+                                        found = true;
+                                        break;
+                                    }
+                                }
+                            }
+                            if found { break; }
+                        }
+                        PathPoint::Vertex(v) => {
+                            if *v != last_v {
+                                ext_verts.push(*v);
+                                found = true;
+                            }
+                            break;
+                        }
+                    }
+                }
+            }
+            if ext_verts.len() < 3 { continue; }
+            // De-dup consecutive identical vertices
+            ext_verts.dedup();
+            if ext_verts.len() < 3 { continue; }
+            let ext_start = if run_start_idx > 0 { run_start_idx - 1 } else { run_start_idx };
+            let ext_end = if run_end_idx < n { run_end_idx + 1 } else { run_end_idx };
+
+            // Build crossed edges and optimize the vertex sub-path
+            if let Some(crossed) = vertex_path_to_crossed_edges(mesh, &ext_verts) {
+                if !crossed.is_empty() {
+                    let ws = ext_verts[0];
+                    let we = *ext_verts.last().unwrap();
+                    let mut pp = vec![PathPoint::Vertex(ws)];
+                    for &(v0, v1) in &crossed {
+                        pp.push(PathPoint::Edge { v0, v1, t: 0.5 });
+                    }
+                    pp.push(PathPoint::Vertex(we));
+                    let proxy = GeodesicPath { points: pp, is_closed: false };
+                    // Use Euclidean geometry for the strip optimization:
+                    // boundary vertex runs are in fast zones where metric ≈ Euclidean.
+                    // Metric strip distortion would reject valid improvements.
+                    let mut euc_mesh = mesh.clone();
+                    euc_mesh.clear_metric();
+                    let opt = optimize_strip(&euc_mesh, &proxy);
+                    let orig_seg = GeodesicPath {
+                        points: pts[ext_start..ext_end].to_vec(),
+                        is_closed: false,
+                    };
+                    // Compare using metric_length on the ORIGINAL mesh
+                    // (the strip is Euclidean-correct, but the acceptance
+                    // criterion must respect the speed field)
+                    if opt.metric_length(mesh) < orig_seg.metric_length(mesh) - 1e-14 {
+                        let mut new_pts = result.points[..ext_start].to_vec();
+                        new_pts.extend(opt.points);
+                        new_pts.extend_from_slice(&result.points[ext_end..]);
+                        result = GeodesicPath { points: new_pts, is_closed: false };
+                    }
+                }
+            }
         }
     }
 
