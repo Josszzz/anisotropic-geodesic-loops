@@ -124,25 +124,11 @@ impl GeodesicPath {
 
     /// Metric length of the path.
     ///
-    /// For each segment, the metric length is computed by subdividing into
-    /// small steps and integrating the local metric ratio (metric/euclidean).
-    /// This correctly handles long segments that cross regions with varying
-    /// speed (e.g. a segment crossing a slow zone).
+    /// For Euclidean metric, uses exact edge/segment lengths.
+    /// For non-Euclidean metrics, integrates the speed field along each segment
+    /// via barycentric interpolation. This gives consistent results regardless
+    /// of whether the path has edge crossings or only vertex points.
     pub fn metric_length(&self, mesh: &HalfedgeMesh) -> f64 {
-        // For pure-vertex paths, use the exact mesh edge weights.
-        if self.points.iter().all(|p| p.as_vertex().is_some()) {
-            let verts = self.vertex_indices();
-            let base = crate::geodesic::path_metric_length(mesh, &verts);
-            let close = if self.is_closed && verts.len() >= 2 {
-                let l = *verts.last().unwrap();
-                let f = verts[0];
-                if l == f { 0.0 } else { metric_edge_len_between(mesh, l, f) }
-            } else {
-                0.0
-            };
-            return base + close;
-        }
-        // For paths with edge crossings, integrate the metric along each segment.
         if mesh.is_euclidean() {
             return self.euclidean_length(mesh);
         }
