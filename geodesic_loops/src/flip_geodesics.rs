@@ -571,7 +571,9 @@ fn vertex_path_to_crossed_edges(
 ) -> Option<Vec<(usize, usize)>> {
     if vpath.len() < 3 { return None; }
 
-    let mut crossed = Vec::new();
+    // For each intermediate vertex, compute BOTH fan directions and their
+    // reversed interior edges. We'll pick the compatible direction later.
+    let mut fan_options: Vec<(Vec<(usize, usize)>, Vec<(usize, usize)>)> = Vec::new();
 
     for i in 1..vpath.len() - 1 {
         let prev_v = vpath[i - 1];
@@ -585,22 +587,67 @@ fn vertex_path_to_crossed_edges(
         if h_in == INVALID { return None; }
         let h_target = mesh.twin(h_in);
         if h_target == INVALID { return None; }
-        if h_out == h_target { continue; }
 
-        // Try CCW then CW fan
-        let fan_he = if let Some((fan, _)) = unfold_fan_ccw(mesh, v, h_out, h_target) {
-            fan
-        } else if let Some((fan, _)) = unfold_fan_cw(mesh, v, h_out, h_target) {
-            fan
-        } else {
-            return None;
+        if h_out == h_target {
+            fan_options.push((Vec::new(), Vec::new()));
+            continue;
+        }
+
+        let extract = |fan_he: &[usize]| -> Vec<(usize, usize)> {
+            (1..fan_he.len() - 1).rev()
+                .map(|k| (mesh.origin(fan_he[k]), mesh.dest(fan_he[k])))
+                .collect()
         };
 
-        // Collect interior radial edges in REVERSE order (from h_target side toward
-        // h_out side) so they appear in strip order (start → end).
-        for k in (1..fan_he.len() - 1).rev() {
-            let h = fan_he[k];
-            crossed.push((mesh.origin(h), mesh.dest(h)));
+        let ccw_edges = unfold_fan_ccw(mesh, v, h_out, h_target)
+            .map(|(fan, _)| extract(&fan))
+            .unwrap_or_default();
+        let cw_edges = unfold_fan_cw(mesh, v, h_out, h_target)
+            .map(|(fan, _)| extract(&fan))
+            .unwrap_or_default();
+
+        if ccw_edges.is_empty() && cw_edges.is_empty() {
+            return None;
+        }
+        fan_options.push((ccw_edges, cw_edges));
+    }
+
+    // Build the crossed-edge sequence by choosing a compatible fan direction
+    // at each step. Try both orderings for the first fan.
+    let result = build_crossed_sequence(&fan_options, false)
+        .or_else(|| build_crossed_sequence(&fan_options, true));
+
+    result
+}
+
+/// Build a crossed-edge sequence from fan options, starting with CCW or CW.
+fn build_crossed_sequence(
+    fan_options: &[(Vec<(usize, usize)>, Vec<(usize, usize)>)],
+    start_with_cw: bool,
+) -> Option<Vec<(usize, usize)>> {
+    let mut crossed = Vec::new();
+
+    for (ccw, cw) in fan_options {
+        if ccw.is_empty() && cw.is_empty() { continue; }
+
+        if crossed.is_empty() {
+            let (first, second) = if start_with_cw { (cw, ccw) } else { (ccw, cw) };
+            if !first.is_empty() {
+                crossed.extend_from_slice(first);
+            } else if !second.is_empty() {
+                crossed.extend_from_slice(second);
+            }
+        } else {
+            let last = *crossed.last().unwrap();
+            let cw_ok = !cw.is_empty() && shared_vertex(last, cw[0]).is_some();
+            let ccw_ok = !ccw.is_empty() && shared_vertex(last, ccw[0]).is_some();
+            if cw_ok {
+                crossed.extend_from_slice(cw);
+            } else if ccw_ok {
+                crossed.extend_from_slice(ccw);
+            } else {
+                return None;
+            }
         }
     }
 
@@ -777,6 +824,89 @@ fn optimize_strip(mesh: &HalfedgeMesh, path: &GeodesicPath) -> GeodesicPath {
     if new_len < old_len - 1e-14 { result } else { path.clone() }
 }
 
+/// Apply strip unfolding in small overlapping windows along a vertex path.
+/// Each window of W vertices is independently optimized. Small windows avoid
+/// geometric distortion that occurs with long metric-weighted strips.
+fn windowed_strip_optimize(mesh: &HalfedgeMesh, verts: &[usize]) -> Vec<PathPoint> {
+    const W: usize = 8; // window size (vertices)
+    let n = verts.len();
+    if n < 3 {
+        return verts.iter().map(|&v| PathPoint::Vertex(v)).collect();
+    }
+
+    // Try to optimize each window; collect (start_idx, optimized_segment) pairs
+    let mut segments: Vec<(usize, Vec<PathPoint>)> = Vec::new();
+    let mut i = 0;
+    while i + 2 < n {
+        let end = (i + W).min(n);
+        let window = &verts[i..end];
+        let mut improved = false;
+
+        if window.len() >= 3 {
+            if let Some(crossed) = vertex_path_to_crossed_edges(mesh, window) {
+                if !crossed.is_empty() {
+                    let ws = window[0];
+                    let we = *window.last().unwrap();
+                    let mut pp = vec![PathPoint::Vertex(ws)];
+                    for &(v0, v1) in &crossed {
+                        pp.push(PathPoint::Edge { v0, v1, t: 0.5 });
+                    }
+                    pp.push(PathPoint::Vertex(we));
+                    let proxy = GeodesicPath { points: pp, is_closed: false };
+                    let opt = optimize_strip(mesh, &proxy);
+                    let orig = GeodesicPath {
+                        points: window.iter().map(|&v| PathPoint::Vertex(v)).collect(),
+                        is_closed: false,
+                    };
+                    if opt.metric_length(mesh) < orig.metric_length(mesh) - 1e-14 {
+                        segments.push((i, opt.points));
+                        i = end - 1; // next window starts at the last vertex of this one
+                        improved = true;
+                    }
+                }
+            }
+        }
+        if !improved {
+            i += 1;
+        }
+    }
+
+    // Merge: build the output path from original vertices + optimized segments
+    if segments.is_empty() {
+        return verts.iter().map(|&v| PathPoint::Vertex(v)).collect();
+    }
+
+    let mut result: Vec<PathPoint> = Vec::new();
+    let mut cursor = 0usize;
+    for (seg_start, seg_pts) in &segments {
+        // Add original vertices from cursor to seg_start
+        for j in cursor..*seg_start {
+            result.push(PathPoint::Vertex(verts[j]));
+        }
+        // Add the optimized segment (including its start vertex)
+        result.extend_from_slice(seg_pts);
+        // The segment ends at verts[seg_start + W - 1] or similar;
+        // find the last vertex of the segment to set cursor
+        if let Some(last_v) = seg_pts.last().and_then(|p| p.as_vertex()) {
+            cursor = verts.iter().position(|&v| v == last_v).unwrap_or(n);
+        } else {
+            cursor = n; // shouldn't happen
+        }
+    }
+    // Add remaining vertices after the last segment
+    for j in cursor..n {
+        // Avoid duplicating the last vertex of the last segment
+        if !result.is_empty() {
+            if let Some(PathPoint::Vertex(last_v)) = result.last() {
+                if *last_v == verts[j] { continue; }
+            }
+        }
+        result.push(PathPoint::Vertex(verts[j]));
+    }
+
+    if result.len() >= 2 { result } else { verts.iter().map(|&v| PathPoint::Vertex(v)).collect() }
+}
+
 // ────────────────────────────────────────────────────────────────
 // Configuration
 // ────────────────────────────────────────────────────────────────
@@ -812,48 +942,7 @@ pub fn shorten_path(
         return path.clone();
     }
 
-    // Pre-optimization: if the path is a pure vertex path (from Dijkstra),
-    // try strip unfolding via fan expansion BEFORE per-vertex shortening.
-    // This handles cases where the Dijkstra path follows mesh boundaries
-    // and per-vertex shortening can't improve (locally straight vertices).
-    let pre_opt = if !is_closed {
-        let verts: Vec<usize> = path.points.iter().filter_map(|p| p.as_vertex()).collect();
-        if verts.len() == path.points.len() && verts.len() >= 3 {
-            if let Some(crossed) = vertex_path_to_crossed_edges(mesh, &verts) {
-                let start_v = verts[0];
-                let end_v = *verts.last().unwrap();
-                let proxy = GeodesicPath {
-                    points: {
-                        let mut pp = vec![PathPoint::Vertex(start_v)];
-                        for &(v0, v1) in &crossed {
-                            pp.push(PathPoint::Edge { v0, v1, t: 0.5 });
-                        }
-                        pp.push(PathPoint::Vertex(end_v));
-                        pp
-                    },
-                    is_closed: false,
-                };
-                let opt = optimize_strip(mesh, &proxy);
-                if opt.metric_length(mesh) < path.metric_length(mesh) - 1e-14 {
-                    Some(opt)
-                } else {
-                    None
-                }
-            } else {
-                None
-            }
-        } else {
-            None
-        }
-    } else {
-        None
-    };
-
-    let mut pts = if let Some(opt) = pre_opt {
-        opt.points
-    } else {
-        path.points.clone()
-    };
+    let mut pts = path.points.clone();
 
     let mut prev_len = f64::INFINITY;
 
@@ -912,9 +1001,49 @@ pub fn shorten_path(
 
     let mut result = GeodesicPath { points: pts, is_closed };
 
-    // Post-process with strip unfolding for global optimization
+    // Post-process: strip unfolding for all-edge-crossing paths
     if !is_closed {
         result = optimize_strip(mesh, &result);
+    }
+
+    // Post-process: windowed strip unfolding for remaining vertex runs.
+    // After per-vertex shortening, some vertices (especially on mesh boundaries)
+    // remain unshortened. Find contiguous runs of Vertex points and optimize them.
+    if !is_closed {
+        let pts = &result.points;
+        // Find runs of consecutive Vertex points of length >= 3
+        let mut new_pts: Vec<PathPoint> = Vec::new();
+        let mut run_start = None;
+        for i in 0..=pts.len() {
+            let is_vertex = i < pts.len() && pts[i].as_vertex().is_some();
+            if is_vertex {
+                if run_start.is_none() { run_start = Some(i); }
+            } else {
+                if let Some(start) = run_start {
+                    let run = &pts[start..i];
+                    let run_verts: Vec<usize> = run.iter()
+                        .filter_map(|p| p.as_vertex()).collect();
+                    if run_verts.len() >= 3 {
+                        let optimized = windowed_strip_optimize(mesh, &run_verts);
+                        // Skip first if it duplicates the last non-vertex point
+                        if start > 0 && !new_pts.is_empty() {
+                            new_pts.extend_from_slice(&optimized);
+                        } else {
+                            new_pts.extend(optimized);
+                        }
+                    } else {
+                        new_pts.extend_from_slice(run);
+                    }
+                    run_start = None;
+                }
+                if i < pts.len() {
+                    new_pts.push(pts[i].clone());
+                }
+            }
+        }
+        if new_pts.len() >= 2 {
+            result = GeodesicPath { points: new_pts, is_closed: false };
+        }
     }
 
     result
