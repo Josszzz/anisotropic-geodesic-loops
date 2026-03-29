@@ -124,25 +124,11 @@ impl GeodesicPath {
 
     /// Metric length of the path.
     ///
-    /// For each segment, the metric length is computed by subdividing into
-    /// small steps and integrating the local metric ratio (metric/euclidean).
-    /// This correctly handles long segments that cross regions with varying
-    /// speed (e.g. a segment crossing a slow zone).
+    /// For Euclidean metric, uses exact edge/segment lengths.
+    /// For non-Euclidean metrics, integrates the speed field along each segment
+    /// via barycentric interpolation. This gives consistent results regardless
+    /// of whether the path has edge crossings or only vertex points.
     pub fn metric_length(&self, mesh: &HalfedgeMesh) -> f64 {
-        // For pure-vertex paths, use the exact mesh edge weights.
-        if self.points.iter().all(|p| p.as_vertex().is_some()) {
-            let verts = self.vertex_indices();
-            let base = crate::geodesic::path_metric_length(mesh, &verts);
-            let close = if self.is_closed && verts.len() >= 2 {
-                let l = *verts.last().unwrap();
-                let f = verts[0];
-                if l == f { 0.0 } else { metric_edge_len_between(mesh, l, f) }
-            } else {
-                0.0
-            };
-            return base + close;
-        }
-        // For paths with edge crossings, integrate the metric along each segment.
         if mesh.is_euclidean() {
             return self.euclidean_length(mesh);
         }
@@ -266,7 +252,12 @@ fn barycentric_coords(
     let v = (d11 * d20 - d01 * d21) / denom;
     let w = (d00 * d21 - d01 * d20) / denom;
     let u = 1.0 - v - w;
-    (u.max(0.0), v.max(0.0), w.max(0.0))
+    // Clamp negatives and renormalize so u+v+w = 1
+    let uc = u.max(0.0);
+    let vc = v.max(0.0);
+    let wc = w.max(0.0);
+    let s = uc + vc + wc;
+    if s > 1e-30 { (uc / s, vc / s, wc / s) } else { (1.0 / 3.0, 1.0 / 3.0, 1.0 / 3.0) }
 }
 
 /// Walk across faces to locate the face containing `pt`, starting from `hint`.
@@ -1085,36 +1076,280 @@ impl Default for FlipConfig {
 // Main shortening loop
 // ────────────────────────────────────────────────────────────────
 
-/// Shorten a geodesic path by iteratively replacing interior Vertex points
-/// with edge-crossing PathPoints via fan unfolding.
-///
-/// When the mesh is not intrinsically Delaunay, non-Delaunay edges can trap
-/// the shortening in local optima. We first flip edges on a **copy** of the
-/// mesh to make it Delaunay, run the shortening on the Delaunay copy, then
-/// translate the result back to the original mesh's edge parameterization.
+/// Shorten a geodesic path using FlipOut (Sharp & Crane 2020) on an
+/// intrinsic triangulation, then extract edge crossings on the original mesh.
+/// Falls back to Polthier-Schmies if FlipOut can't improve the path.
 pub fn shorten_path(
     mesh: &HalfedgeMesh,
     path: &GeodesicPath,
     config: &FlipConfig,
 ) -> GeodesicPath {
-    // Create an intrinsic copy, convert edge lengths to metric, flip to
-    // Delaunay, then shorten on the flipped copy. The result is translated
-    // back to the original mesh's edge parameterization.
-    let mut dm = mesh.clone();
+    // Step 1: Polthier-Schmies shortening (fast, handles edge crossings)
+    let ps_result = shorten_path_inner(mesh, path, config);
+
+    // Step 2: FlipOut on the Dijkstra vertex path (handles non-straight
+    // vertices that Polthier-Schmies can't improve, e.g. path turns).
+    // Skip for Euclidean: PS + strip unfolding is already exact.
+    if mesh.is_euclidean() { return ps_result; }
+    if path.points.len() < 3 { return ps_result; }
+    let verts: Vec<usize> = path.points.iter().filter_map(|p| p.as_vertex()).collect();
+    if verts.len() != path.points.len() { return ps_result; }
+
+    let mut imesh = mesh.clone();
     if !mesh.is_euclidean() {
-        dm.init_metric_edge_lengths();
+        imesh.init_metric_edge_lengths();
     }
-    let n_flips = dm.flip_to_delaunay(dm.n_edges() * 4);
-    if n_flips > 0 {
-        let result_on_dm = shorten_path_inner(&dm, path, config);
-        let translated = translate_path_to_original(mesh, &dm, &result_on_dm);
-        // Compare with the non-flipped result (both on original mesh)
-        let result_no_flip = shorten_path_inner(mesh, path, config);
-        let len_flip = translated.metric_length(mesh);
-        let len_noflip = result_no_flip.metric_length(mesh);
-        return if len_flip < len_noflip { translated } else { result_no_flip };
+
+    let mut edge_path: Vec<usize> = Vec::new();
+    for w in verts.windows(2) {
+        let h = find_halfedge(&imesh, w[0], w[1]);
+        if h == INVALID { return ps_result; }
+        edge_path.push(h);
     }
-    shorten_path_inner(mesh, path, config)
+
+    let initial_len: f64 = edge_path.iter().map(|&h| imesh.edge_len(h)).sum();
+    let mut failed_vertices = std::collections::HashSet::new();
+    let max_iters = (edge_path.len() * 10).min(config.max_iterations);
+    for _iter in 0..max_iters {
+        let n_edges = edge_path.len();
+        if n_edges < 2 { break; }
+
+        let mut worst_idx = None;
+        let mut worst_angle = std::f64::consts::PI - 1e-10;
+        for i in 0..n_edges - 1 {
+            let b = imesh.dest(edge_path[i]);
+            if failed_vertices.contains(&b) { continue; }
+            let angle = smaller_wedge_angle(&imesh, b, edge_path[i], edge_path[i + 1]);
+            if angle < worst_angle {
+                worst_angle = angle;
+                worst_idx = Some(i);
+            }
+        }
+        let idx = match worst_idx { Some(i) => i, None => break };
+
+        let h_in = edge_path[idx];
+        let h_out = if idx + 1 < n_edges { edge_path[idx + 1] } else { edge_path[0] };
+        let b = imesh.dest(h_in);
+
+        if let Some(outer_arc) = flip_out_at_vertex(&mut imesh, b, h_in, h_out) {
+            let arc_len: f64 = outer_arc.iter().map(|&h| imesh.edge_len(h)).sum();
+            let replaced_len = imesh.edge_len(h_in) + imesh.edge_len(h_out);
+            if arc_len >= replaced_len {
+                // Outer arc is NOT shorter — skip this vertex
+                failed_vertices.insert(b);
+                continue;
+            }
+            if idx + 1 < n_edges {
+                edge_path.splice(idx..=idx + 1, outer_arc);
+            } else {
+                edge_path.pop();
+                edge_path.splice(0..1, outer_arc);
+            }
+            failed_vertices.clear();
+        } else {
+            failed_vertices.insert(b);
+        }
+    }
+
+    let final_len: f64 = edge_path.iter().map(|&h| imesh.edge_len(h)).sum();
+    if final_len < initial_len - 1e-14 {
+        // FlipOut improved the path: extract and compare with PS result
+        let flipout_result = extract_edge_path_on_original(mesh, &imesh, &edge_path, path.is_closed);
+        let fo_len = flipout_result.metric_length(mesh);
+        let ps_len = ps_result.metric_length(mesh);
+        if fo_len < ps_len { flipout_result } else { ps_result }
+    } else {
+        ps_result
+    }
+}
+
+
+fn smaller_wedge_angle(mesh: &HalfedgeMesh, b: usize, h_in: usize, h_out: usize) -> f64 {
+    // Walk CCW from h_out to twin(h_in) = b→origin(h_in)
+    let h_target = mesh.twin(h_in); // halfedge from b toward prev vertex
+    let mut angle = 0.0f64;
+    let mut h = h_out;
+    for _ in 0..512 {
+        if mesh.is_boundary_he(h) { return f64::INFINITY; }
+        angle += mesh.corner_angle(h);
+        let ph = mesh.prev(h);
+        if ph == INVALID { return f64::INFINITY; }
+        let hn = mesh.twin(ph);
+        if hn == INVALID { return f64::INFINITY; }
+        if hn == h_target { break; }
+        h = hn;
+        if angle > 2.0 * std::f64::consts::PI { return f64::INFINITY; }
+    }
+    // Also compute CW angle
+    let total = mesh.vertex_angle_sum(b);
+    let other = total - angle;
+    angle.min(other)
+}
+
+/// FlipOut at vertex b (Algorithm 1 from Sharp & Crane 2020).
+///
+/// Repeatedly flips edges from b into the smaller wedge until all
+/// outer arc angles β_i ≥ π, then returns the outer arc as halfedges.
+fn flip_out_at_vertex(
+    mesh: &mut HalfedgeMesh,
+    b: usize,
+    h_in: usize,   // halfedge prev → b
+    h_out: usize,   // halfedge b → next
+) -> Option<Vec<usize>> {
+    let h_target = mesh.twin(h_in); // b → prev
+
+    // Iteratively flip edges out of the wedge
+    for _round in 0..500 {
+        let wedge = collect_wedge_ccw(mesh, b, h_out, h_target)?;
+        let k = wedge.len() - 1; // degree = number of triangles
+        if k <= 1 { break; }     // single triangle or empty → done
+
+        // Check each interior vertex n_j (wedge[1]..wedge[k-1]) for β < π.
+        // β < π in the unfolded plane ⟺ sum of angles at n_j in the two
+        // adjacent wedge faces > π (the edge b→n_j is "non-Delaunay" in the wedge).
+        let mut did_flip = false;
+        for j in 1..k {
+            let alpha_left = mesh.corner_angle(mesh.prev(wedge[j - 1]));
+            let alpha_right = mesh.corner_angle(mesh.next(wedge[j]));
+            if alpha_left + alpha_right > std::f64::consts::PI + 1e-10 {
+                // β_j < π: flip edge b→n_j out of the wedge
+                // After flip, b→n_j becomes n_{j-1}→n_{j+1}. This removes
+                // n_j from the wedge and decreases its degree by 1.
+                // h_out and h_target must remain valid after the flip.
+                let he = wedge[j];
+                // Check that flipping won't invalidate h_out or h_target
+                // (they could be in adjacent faces that get modified)
+                if mesh.flip_edge(he) {
+                    // Verify h_out and h_target are still valid
+                    if mesh.origin(h_out) != b || mesh.origin(h_target) != b {
+                        // Flip broke our references — abort
+                        return None;
+                    }
+                    did_flip = true;
+                    break;
+                }
+            }
+        }
+        if !did_flip { break; } // all β ≥ π → wedge is convex
+    }
+
+    // Collect the outer arc: for each face in the final wedge,
+    // the outer edge is next(wedge[j]) = edge from n_j to n_{j+1}.
+    let wedge = collect_wedge_ccw(mesh, b, h_out, h_target)?;
+    let k = wedge.len() - 1;
+    let mut outer_arc = Vec::new();
+    for j in 0..k {
+        outer_arc.push(mesh.next(wedge[j]));
+    }
+    // outer_arc goes: c→n1, n1→n2, ..., n_{k-1}→a
+    // But we need a→...→c. Reverse and use twins.
+    outer_arc.reverse();
+    outer_arc = outer_arc.iter().map(|&h| mesh.twin(h)).collect();
+
+    // Verify connectivity: each edge must connect to the next
+    let a = mesh.origin(h_in);
+    let c = mesh.dest(h_out);
+    if outer_arc.is_empty() { return None; }
+    if mesh.origin(outer_arc[0]) != a { return None; }
+    if mesh.dest(*outer_arc.last().unwrap()) != c { return None; }
+    for w in outer_arc.windows(2) {
+        if mesh.dest(w[0]) != mesh.origin(w[1]) { return None; }
+    }
+
+    Some(outer_arc)
+}
+
+/// Collect CCW wedge halfedges from b (halfedges from b to outer vertices).
+fn collect_wedge_ccw(
+    mesh: &HalfedgeMesh, b: usize, h_out: usize, h_target: usize,
+) -> Option<Vec<usize>> {
+    let mut result = vec![h_out];
+    let mut h = h_out;
+    for _ in 0..512 {
+        if mesh.is_boundary_he(h) { return None; }
+        let ph = mesh.prev(h);
+        if ph == INVALID { return None; }
+        let hn = mesh.twin(ph);
+        if hn == INVALID { return None; }
+        result.push(hn);
+        if hn == h_target { return Some(result); }
+        h = hn;
+    }
+    None
+}
+
+/// Collect CW wedge halfedges from b.
+fn collect_wedge_cw(
+    mesh: &HalfedgeMesh, b: usize, h_out: usize, h_target: usize,
+) -> Option<Vec<usize>> {
+    let mut result = vec![h_out];
+    let mut h = h_out;
+    for _ in 0..512 {
+        let th = mesh.twin(h);
+        if th == INVALID { return None; }
+        if mesh.is_boundary_he(th) { return None; }
+        let hn = mesh.next(th);
+        if hn == INVALID { return None; }
+        if mesh.origin(hn) != b { return None; }
+        result.push(hn);
+        if hn == h_target { return Some(result); }
+        h = hn;
+    }
+    None
+}
+
+/// Extract an intrinsic edge path as PathPoints on the original mesh.
+/// Each edge in the intrinsic mesh either exists in the original (keep as Vertex
+/// endpoints) or was created by flipping (convert to Edge crossing).
+fn extract_edge_path_on_original(
+    orig: &HalfedgeMesh,
+    imesh: &HalfedgeMesh,
+    edge_path: &[usize],
+    is_closed: bool,
+) -> GeodesicPath {
+    if edge_path.is_empty() {
+        return GeodesicPath { points: Vec::new(), is_closed };
+    }
+
+    let mut points = Vec::new();
+    // Add the first vertex
+    points.push(PathPoint::Vertex(imesh.origin(edge_path[0])));
+
+    for &he in edge_path {
+        let v0 = imesh.origin(he);
+        let v1 = imesh.dest(he);
+
+        // Check if this edge exists in the original mesh
+        let h_orig = find_halfedge(orig, v0, v1);
+        if h_orig != INVALID {
+            // Edge exists — just add the destination vertex
+            points.push(PathPoint::Vertex(v1));
+        } else {
+            // Edge was created by flipping — find the 3D position of the midpoint
+            // and project onto the original mesh
+            let pos = imesh.position(v0); // approximate: use v0 position
+            let pos2 = imesh.position(v1);
+            let mid = [
+                (pos[0] + pos2[0]) * 0.5,
+                (pos[1] + pos2[1]) * 0.5,
+                (pos[2] + pos2[2]) * 0.5,
+            ];
+            if let Some(pt) = locate_point_on_original(orig, &mid, v0, v1) {
+                points.push(pt);
+            }
+            points.push(PathPoint::Vertex(v1));
+        }
+    }
+
+    // For closed paths, remove the duplicate last vertex
+    if is_closed && points.len() >= 2 {
+        if let (Some(PathPoint::Vertex(f)), Some(PathPoint::Vertex(l))) =
+            (points.first(), points.last()) {
+            if f == l { points.pop(); }
+        }
+    }
+
+    GeodesicPath { points, is_closed }
 }
 
 /// Translate a path from a Delaunay-flipped mesh back to the original mesh.
@@ -1308,43 +1543,140 @@ fn shorten_path_inner(
         result = optimize_strip(mesh, &result);
     }
 
-    // Post-process: windowed strip unfolding for remaining vertex runs.
-    // After per-vertex shortening, some vertices (especially on mesh boundaries)
-    // remain unshortened. Find contiguous runs of Vertex points and optimize them.
-    if !is_closed {
-        let pts = &result.points;
-        // Find runs of consecutive Vertex points of length >= 3
-        let mut new_pts: Vec<PathPoint> = Vec::new();
-        let mut run_start = None;
-        for i in 0..=pts.len() {
-            let is_vertex = i < pts.len() && pts[i].as_vertex().is_some();
-            if is_vertex {
+    // Post-process: for each contiguous run of ≥3 Vertex points, apply
+    // strip unfolding. Include the adjacent Edge-crossing points so the
+    // optimizer sees where the path comes from / goes to (otherwise collinear
+    // boundary runs can't be straightened).
+    if !is_closed && result.points.len() >= 3 {
+        let pts = result.points.clone();
+        let n = pts.len();
+
+        // Identify vertex runs (start_index, length)
+        let mut runs: Vec<(usize, usize)> = Vec::new();
+        let mut run_start: Option<usize> = None;
+        for i in 0..=n {
+            let is_v = i < n && pts[i].as_vertex().is_some();
+            if is_v {
                 if run_start.is_none() { run_start = Some(i); }
-            } else {
-                if let Some(start) = run_start {
-                    let run = &pts[start..i];
-                    let run_verts: Vec<usize> = run.iter()
-                        .filter_map(|p| p.as_vertex()).collect();
-                    if run_verts.len() >= 3 {
-                        let optimized = windowed_strip_optimize(mesh, &run_verts);
-                        // Skip first if it duplicates the last non-vertex point
-                        if start > 0 && !new_pts.is_empty() {
-                            new_pts.extend_from_slice(&optimized);
-                        } else {
-                            new_pts.extend(optimized);
-                        }
-                    } else {
-                        new_pts.extend_from_slice(run);
-                    }
-                    run_start = None;
-                }
-                if i < pts.len() {
-                    new_pts.push(pts[i].clone());
-                }
+            } else if let Some(s) = run_start {
+                if i - s >= 3 { runs.push((s, i - s)); }
+                run_start = None;
             }
         }
-        if new_pts.len() >= 2 {
-            result = GeodesicPath { points: new_pts, is_closed: false };
+
+        // Process runs in reverse order (so splice indices stay valid)
+        for &(run_start_idx, run_len) in runs.iter().rev() {
+            let run_end_idx = run_start_idx + run_len; // exclusive
+            let run_verts: Vec<usize> = pts[run_start_idx..run_end_idx]
+                .iter().filter_map(|p| p.as_vertex()).collect();
+            if run_verts.len() < 3 { continue; }
+
+            // Build extended vertex list: the run's vertices plus one
+            // adjacent vertex on each side extracted from neighboring
+            // edge crossings (their v0 gives the hub vertex).
+            let mut ext_verts = run_verts.clone();
+            // Prepend: scan backward to find a non-collinear hub vertex
+            {
+                let first_v = ext_verts[0];
+                let mut found = false;
+                for k in (run_start_idx.saturating_sub(6)..run_start_idx).rev() {
+                    match &pts[k] {
+                        PathPoint::Edge { v0, v1, .. } => {
+                            for &candidate in &[*v1, *v0] {
+                                if candidate != first_v {
+                                    let h = find_halfedge(mesh, candidate, first_v);
+                                    if h != INVALID {
+                                        ext_verts.insert(0, candidate);
+                                        found = true;
+                                        break;
+                                    }
+                                }
+                            }
+                            if found { break; }
+                        }
+                        PathPoint::Vertex(v) => {
+                            if *v != first_v {
+                                ext_verts.insert(0, *v);
+                                found = true;
+                            }
+                            break;
+                        }
+                    }
+                }
+            }
+            // Append: scan forward past any edge crossings to find a
+            // vertex that gives directional context (preferably non-collinear
+            // with the boundary run). Try v0, v1 of each edge crossing,
+            // then the next Vertex point.
+            {
+                let last_v = *ext_verts.last().unwrap();
+                let mut found = false;
+                for k in run_end_idx..n.min(run_end_idx + 6) {
+                    match &pts[k] {
+                        PathPoint::Edge { v0, v1, .. } => {
+                            // Prefer the vertex that's NOT on the boundary
+                            // (gives diagonal direction info)
+                            for &candidate in &[*v1, *v0] {
+                                if candidate != last_v {
+                                    let h = find_halfedge(mesh, last_v, candidate);
+                                    if h != INVALID {
+                                        ext_verts.push(candidate);
+                                        found = true;
+                                        break;
+                                    }
+                                }
+                            }
+                            if found { break; }
+                        }
+                        PathPoint::Vertex(v) => {
+                            if *v != last_v {
+                                ext_verts.push(*v);
+                                found = true;
+                            }
+                            break;
+                        }
+                    }
+                }
+            }
+            if ext_verts.len() < 3 { continue; }
+            // De-dup consecutive identical vertices
+            ext_verts.dedup();
+            if ext_verts.len() < 3 { continue; }
+            let ext_start = if run_start_idx > 0 { run_start_idx - 1 } else { run_start_idx };
+            let ext_end = if run_end_idx < n { run_end_idx + 1 } else { run_end_idx };
+
+            // Build crossed edges and optimize the vertex sub-path
+            if let Some(crossed) = vertex_path_to_crossed_edges(mesh, &ext_verts) {
+                if !crossed.is_empty() {
+                    let ws = ext_verts[0];
+                    let we = *ext_verts.last().unwrap();
+                    let mut pp = vec![PathPoint::Vertex(ws)];
+                    for &(v0, v1) in &crossed {
+                        pp.push(PathPoint::Edge { v0, v1, t: 0.5 });
+                    }
+                    pp.push(PathPoint::Vertex(we));
+                    let proxy = GeodesicPath { points: pp, is_closed: false };
+                    // Use Euclidean geometry for the strip optimization:
+                    // boundary vertex runs are in fast zones where metric ≈ Euclidean.
+                    // Metric strip distortion would reject valid improvements.
+                    let mut euc_mesh = mesh.clone();
+                    euc_mesh.clear_metric();
+                    let opt = optimize_strip(&euc_mesh, &proxy);
+                    let orig_seg = GeodesicPath {
+                        points: pts[ext_start..ext_end].to_vec(),
+                        is_closed: false,
+                    };
+                    // Compare using metric_length on the ORIGINAL mesh
+                    // (the strip is Euclidean-correct, but the acceptance
+                    // criterion must respect the speed field)
+                    if opt.metric_length(mesh) < orig_seg.metric_length(mesh) - 1e-14 {
+                        let mut new_pts = result.points[..ext_start].to_vec();
+                        new_pts.extend(opt.points);
+                        new_pts.extend_from_slice(&result.points[ext_end..]);
+                        result = GeodesicPath { points: new_pts, is_closed: false };
+                    }
+                }
+            }
         }
     }
 
