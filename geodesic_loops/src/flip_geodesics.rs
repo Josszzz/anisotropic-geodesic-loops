@@ -252,7 +252,12 @@ fn barycentric_coords(
     let v = (d11 * d20 - d01 * d21) / denom;
     let w = (d00 * d21 - d01 * d20) / denom;
     let u = 1.0 - v - w;
-    (u.max(0.0), v.max(0.0), w.max(0.0))
+    // Clamp negatives and renormalize so u+v+w = 1
+    let uc = u.max(0.0);
+    let vc = v.max(0.0);
+    let wc = w.max(0.0);
+    let s = uc + vc + wc;
+    if s > 1e-30 { (uc / s, vc / s, wc / s) } else { (1.0 / 3.0, 1.0 / 3.0, 1.0 / 3.0) }
 }
 
 /// Walk across faces to locate the face containing `pt`, starting from `hint`.
