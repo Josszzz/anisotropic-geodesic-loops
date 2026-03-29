@@ -1071,117 +1071,24 @@ impl Default for FlipConfig {
 // Main shortening loop
 // ────────────────────────────────────────────────────────────────
 
-/// Shorten a geodesic path using the FlipOut algorithm (Sharp & Crane 2020).
+/// Shorten a geodesic path by iteratively replacing interior Vertex points
+/// with edge-crossing PathPoints via fan unfolding (Polthier & Schmies).
 ///
-/// The path is represented as an edge path on an intrinsic triangulation.
-/// At each non-straight vertex, FlipOut flips edges out of the wedge and
-/// replaces the path segment with the shorter outer arc. This is repeated
-/// until all vertices are locally straight (geodesic).
-///
-/// The result is extracted as edge crossings on the original mesh.
+/// For non-Euclidean metrics, edge lengths are converted to metric lengths
+/// on an intrinsic copy. For Euclidean metrics, full-path strip unfolding
+/// gives exact results.
 pub fn shorten_path(
     mesh: &HalfedgeMesh,
     path: &GeodesicPath,
     config: &FlipConfig,
 ) -> GeodesicPath {
-    if path.points.len() < 2 { return path.clone(); }
-
-    // Build intrinsic triangulation: clone mesh, convert edge lengths to metric
-    let mut imesh = mesh.clone();
-    if !mesh.is_euclidean() {
-        imesh.init_metric_edge_lengths();
-    }
-
-    // Extract vertex path from the input
-    let verts: Vec<usize> = path.points.iter().filter_map(|p| p.as_vertex()).collect();
-    if verts.len() < 2 { return path.clone(); }
-
-    // Convert vertex path to edge path (sequence of halfedge indices on imesh)
-    let mut edge_path: Vec<usize> = Vec::new();
-    for w in verts.windows(2) {
-        let h = find_halfedge(&imesh, w[0], w[1]);
-        if h == INVALID { return path.clone(); }
-        edge_path.push(h);
-    }
-
-    // FlipOut iteration: process non-straight interior nodes
-    let max_iters = (edge_path.len() * edge_path.len()).min(config.max_iterations);
-    for _iter in 0..max_iters {
-        let mut improved = false;
-        // Find the worst non-straight interior node
-        let mut worst_idx = None;
-        let mut worst_angle = std::f64::consts::PI;
-        let n_edges = edge_path.len();
-        if n_edges < 2 { break; }
-
-        for i in 0..n_edges - 1 {
-            // Joint at vertex b = dest(edge_path[i]) = origin(edge_path[i+1])
-            let b = imesh.dest(edge_path[i]);
-            let h_in = edge_path[i];
-            let h_out = edge_path[i + 1];
-            // Compute smaller wedge angle
-            let angle = smaller_wedge_angle(&imesh, b, h_in, h_out);
-            if angle < worst_angle {
-                worst_angle = angle;
-                worst_idx = Some(i);
-            }
-        }
-        // Also check closed-loop case
-        if path.is_closed && n_edges >= 2 {
-            let b = imesh.dest(*edge_path.last().unwrap());
-            let h_in = *edge_path.last().unwrap();
-            let h_out = edge_path[0];
-            let angle = smaller_wedge_angle(&imesh, b, h_in, h_out);
-            if angle < worst_angle {
-                worst_angle = angle;
-                worst_idx = Some(n_edges - 1);
-            }
-        }
-
-        if worst_angle >= std::f64::consts::PI - 1e-10 { break; } // geodesic!
-        let idx = match worst_idx { Some(i) => i, None => break };
-
-        // Apply FlipOut at this joint
-        let h_in = edge_path[idx];
-        let h_out = if idx + 1 < n_edges {
-            edge_path[idx + 1]
-        } else {
-            edge_path[0] // closed loop wrap
-        };
-        let b = imesh.dest(h_in);
-
-        // Save state to rollback if FlipOut doesn't improve
-        let saved_mesh = imesh.clone();
-        let saved_path = edge_path.clone();
-        let old_len: f64 = edge_path.iter().map(|&h| imesh.edge_len(h)).sum();
-
-        if let Some(outer_arc) = flip_out_at_vertex(&mut imesh, b, h_in, h_out) {
-            if idx + 1 < n_edges {
-                edge_path.splice(idx..=idx + 1, outer_arc);
-            } else {
-                edge_path.pop();
-                edge_path.splice(0..1, outer_arc);
-            }
-            let new_len: f64 = edge_path.iter().map(|&h| imesh.edge_len(h)).sum();
-            if new_len < old_len - 1e-14 {
-                improved = true;
-            } else {
-                // Rollback: path didn't improve
-                imesh = saved_mesh;
-                edge_path = saved_path;
-                break;
-            }
-        }
-
-        if !improved { break; }
-    }
-
-    // Extract the edge path as crossings on the original mesh
-    extract_edge_path_on_original(mesh, &imesh, &edge_path, path.is_closed)
+    shorten_path_inner(mesh, path, config)
 }
 
-/// Compute the smaller wedge angle at vertex b between incoming halfedge
-/// h_in (whose dest is b) and outgoing halfedge h_out (whose origin is b).
+// FlipOut-related functions kept for future use on curved surfaces
+// (on flat meshes all vertices are already "straight" so FlipOut is a no-op)
+
+#[allow(dead_code)]
 fn smaller_wedge_angle(mesh: &HalfedgeMesh, b: usize, h_in: usize, h_out: usize) -> f64 {
     // Walk CCW from h_out to twin(h_in) = b→origin(h_in)
     let h_target = mesh.twin(h_in); // halfedge from b toward prev vertex
@@ -1208,6 +1115,7 @@ fn smaller_wedge_angle(mesh: &HalfedgeMesh, b: usize, h_in: usize, h_out: usize)
 ///
 /// Repeatedly flips edges from b into the smaller wedge until all
 /// outer arc angles β_i ≥ π, then returns the outer arc as halfedges.
+#[allow(dead_code)]
 fn flip_out_at_vertex(
     mesh: &mut HalfedgeMesh,
     b: usize,
@@ -1216,6 +1124,8 @@ fn flip_out_at_vertex(
 ) -> Option<Vec<usize>> {
     let h_target = mesh.twin(h_in); // b → prev
 
+    eprintln!("[FLIPOUT] b={}, origin(h_in)={}, dest(h_out)={}, h_out={}, h_target={}",
+        b, mesh.origin(h_in), mesh.dest(h_out), h_out, h_target);
     // Iteratively flip edges out of the wedge
     for _round in 0..500 {
         let wedge = collect_wedge_ccw(mesh, b, h_out, h_target)?;
@@ -1225,17 +1135,16 @@ fn flip_out_at_vertex(
         // Check each interior vertex n_j (wedge[1]..wedge[k-1]) for β < π.
         // β < π in the unfolded plane ⟺ sum of angles at n_j in the two
         // adjacent wedge faces > π (the edge b→n_j is "non-Delaunay" in the wedge).
+        eprintln!("[FLIPOUT] wedge degree={}, verts: {:?}",
+            k, wedge.iter().map(|&h| mesh.dest(h)).collect::<Vec<_>>());
         let mut did_flip = false;
         for j in 1..k {
-            // Angle at n_j in the face between wedge[j-1] and wedge[j]:
-            //   face has halfedges: wedge[j-1]=b→n_{j-1}, n_{j-1}→n_j, n_j→b
-            //   angle at n_j = corner_angle(prev(wedge[j-1]))
             let alpha_left = mesh.corner_angle(mesh.prev(wedge[j - 1]));
-
-            // Angle at n_j in the face of wedge[j]:
-            //   face has halfedges: wedge[j]=b→n_j, n_j→n_{j+1}, n_{j+1}→b
-            //   angle at n_j = corner_angle(next(wedge[j]))
             let alpha_right = mesh.corner_angle(mesh.next(wedge[j]));
+            let nj = mesh.dest(wedge[j]);
+            eprintln!("[FLIPOUT]   j={}, n_j={}, alpha_left={:.3}°, alpha_right={:.3}°, sum={:.3}°",
+                j, nj, alpha_left.to_degrees(), alpha_right.to_degrees(),
+                (alpha_left+alpha_right).to_degrees());
 
             if alpha_left + alpha_right > std::f64::consts::PI + 1e-10 {
                 // β_j < π: flip edge b→n_j out of the wedge
@@ -1273,6 +1182,7 @@ fn flip_out_at_vertex(
 }
 
 /// Collect CCW wedge halfedges from b (halfedges from b to outer vertices).
+#[allow(dead_code)]
 fn collect_wedge_ccw(
     mesh: &HalfedgeMesh, b: usize, h_out: usize, h_target: usize,
 ) -> Option<Vec<usize>> {
@@ -1292,6 +1202,7 @@ fn collect_wedge_ccw(
 }
 
 /// Collect CW wedge halfedges from b.
+#[allow(dead_code)]
 fn collect_wedge_cw(
     mesh: &HalfedgeMesh, b: usize, h_out: usize, h_target: usize,
 ) -> Option<Vec<usize>> {
@@ -1314,6 +1225,7 @@ fn collect_wedge_cw(
 /// Extract an intrinsic edge path as PathPoints on the original mesh.
 /// Each edge in the intrinsic mesh either exists in the original (keep as Vertex
 /// endpoints) or was created by flipping (convert to Edge crossing).
+#[allow(dead_code)]
 fn extract_edge_path_on_original(
     orig: &HalfedgeMesh,
     imesh: &HalfedgeMesh,
