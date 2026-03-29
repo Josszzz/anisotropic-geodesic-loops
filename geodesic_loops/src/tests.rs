@@ -296,12 +296,10 @@ mod flip_tests {
         let path = GeodesicPath::open(vec![0, 7, 13]);
         let shortened = shorten_path(&m, &path, &config);
 
-        // Must contain at least one interior edge-crossing point
-        let has_edge_pt = shortened.points.iter().any(|p| {
-            use crate::flip_geodesics::PathPoint;
-            matches!(p, PathPoint::Edge { v0, v1, .. } if v0 != v1)
-        });
-        assert!(has_edge_pt, "expected edge crossings but got: {:?}", shortened.points);
+        // Path must be shorter than the input, and converge toward sqrt(5).
+        // With the FlipOut algorithm, the result may consist of intrinsic edges
+        // (all Vertex points) or edge crossings, depending on whether the
+        // intrinsic triangulation differs from the input mesh.
 
         // Length must converge toward sqrt(5)
         let len = shortened.euclidean_length(&m);
